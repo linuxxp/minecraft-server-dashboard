@@ -1,0 +1,17 @@
+# Runtime data
+mc-access-log.json
+mc-metrics.json
+.mc-logger-state
+
+# Minecraft server data
+data/
+backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
