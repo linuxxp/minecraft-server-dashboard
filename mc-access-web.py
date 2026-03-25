@@ -3,8 +3,20 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 1.7.0
+Version: 1.7.3
 Changelog:
+  v1.7.3 (2026-03-25)
+    - Removed hourly distribution chart, kept only daily activity (last 14 days)
+    - Added EssentialsX nickname display: "PlayerName (Nickname)" in online list, top players, whitelist
+    - Added EssentialsX nickname display next to player names (online list, whitelist, top players)
+  v1.7.2 (2026-03-25)
+    - Fixed online player count parsing (Paper changed format to "out of maximum")
+    - Fixed player names extraction (now handles "default: player" format)
+    - Fixed utcnow() deprecation warning
+    - Whitelist panel now shows all players from whitelist.json
+  v1.7.1 (2026-03-23)
+    - Added daily activity chart (joins per day, last 14 days)
+    - Activity panel shows daily chart only
   v1.7.0 (2026-03-23)
     - Added /charts page with Chart.js multi-metric graph
     - Metrics: CPU, RAM, MC heap, TPS, player count overlaid with different colors
@@ -51,7 +63,7 @@ import glob
 import functools
 import subprocess
 import psutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 
 app = Flask(__name__)
@@ -60,10 +72,10 @@ METRICS_FILE = "/home/pi/mc-metrics.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "1.7.0"
+VERSION = "1.7.3"
 
-USERNAME = "admin"
-PASSWORD = "changeme"
+USERNAME = "linuxxp"
+PASSWORD = "mechopuhemeche"
 
 PER_PAGE = 50
 SUSPICIOUS_THRESHOLD = 5
@@ -115,6 +127,44 @@ def format_size(size_bytes):
         return f"{size_bytes / 1024:.1f} KB"
     return f"{size_bytes} B"
 
+def get_nicknames():
+    """Read EssentialsX userdata to build name -> nickname mapping"""
+    nicknames = {}
+    userdata_dir = os.path.join(WORLD_DIR, 'plugins', 'Essentials', 'userdata')
+    if not os.path.isdir(userdata_dir):
+        return nicknames
+    try:
+        for filename in os.listdir(userdata_dir):
+            if not filename.endswith('.yml'):
+                continue
+            filepath = os.path.join(userdata_dir, filename)
+            name = None
+            nick = None
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('last-account-name:'):
+                            name = line.split(':', 1)[1].strip().strip('"').strip("'")
+                        elif line.startswith('nickname:'):
+                            nick = line.split(':', 1)[1].strip().strip('"').strip("'")
+                            # Remove EssentialsX formatting codes (§x, &x, etc)
+                            nick = re.sub(r'[§&][0-9a-fk-or]', '', nick)
+                if name and nick and nick != name:
+                    nicknames[name] = nick
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return nicknames
+
+def format_player_name(name, nicknames):
+    """Format player name with nickname if available"""
+    nick = nicknames.get(name, '')
+    if nick:
+        return f"{name} ({nick})"
+    return name
+
 def get_system_status():
     status = {}
     boot_time = datetime.fromtimestamp(int(psutil.boot_time()))
@@ -145,7 +195,7 @@ def get_system_status():
         result = subprocess.run(['docker', 'inspect', '--format', '{{.State.StartedAt}}', 'minecraft'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             started_dt = datetime.fromisoformat(result.stdout.strip()[:19])
-            mc_delta = datetime.utcnow() - started_dt
+            mc_delta = datetime.now(timezone.utc).replace(tzinfo=None) - started_dt
             mc_days, mc_hours, mc_minutes = mc_delta.days, mc_delta.seconds // 3600, (mc_delta.seconds % 3600) // 60
             status['mc_uptime'] = f"{mc_days}d {mc_hours}h {mc_minutes}m" if mc_days > 0 else f"{mc_hours}h {mc_minutes}m"
             status['mc_status'] = 'online'
@@ -160,16 +210,32 @@ def get_system_status():
     try:
         result = subprocess.run(['docker', 'exec', 'minecraft', 'rcon-cli', 'list'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            line = strip_ansi(result.stdout.strip())
-            match = re.search(r'There are (\d+) of a max of (\d+)', line)
-            if match:
-                status['players_online'] = match.group(1)
-                status['players_max'] = match.group(2)
-                if ':' in line:
-                    names_part = line.split(':', 1)[1].strip()
-                    status['player_names'] = [n.strip() for n in names_part.split(',') if n.strip()] if names_part else []
-                else:
-                    status['player_names'] = []
+            full_output = strip_ansi(result.stdout.strip())
+            lines = full_output.split('\n')
+            first_line = lines[0] if lines else ''
+            count_match = re.search(r'There are (\d+)', first_line)
+            max_match = re.search(r'(?:maximum|max of)\s+(\d+)', first_line)
+            if count_match:
+                status['players_online'] = count_match.group(1)
+                status['players_max'] = max_match.group(1) if max_match else '20'
+                # Extract player names - could be on same line after ":" or on next lines
+                player_names = []
+                # Check first line for names after colon
+                if ':' in first_line:
+                    names_part = first_line.split(':', 1)[1].strip()
+                    if names_part and 'player' not in names_part.lower():
+                        player_names = [n.strip() for n in names_part.split(',') if n.strip()]
+                # Check subsequent lines (Paper format: "default: player1, player2")
+                for extra_line in lines[1:]:
+                    extra_line = extra_line.strip()
+                    if extra_line:
+                        if ':' in extra_line:
+                            names_part = extra_line.split(':', 1)[1].strip()
+                        else:
+                            names_part = extra_line
+                        if names_part:
+                            player_names.extend([n.strip() for n in names_part.split(',') if n.strip()])
+                status['player_names'] = player_names
             else:
                 status['players_online'] = '0'
                 status['players_max'] = '20'
@@ -308,6 +374,24 @@ def get_hourly_activity(events):
             continue
     return hours
 
+def get_daily_activity(events):
+    now = datetime.now()
+    days = {}
+    for i in range(13, -1, -1):
+        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        days[day] = 0
+    for e in events:
+        if e.get('type') != 'JOIN': continue
+        ts = e.get('timestamp', '')
+        try:
+            if 'T' in ts:
+                day = ts[:10]
+                if day in days:
+                    days[day] += 1
+        except (ValueError, IndexError):
+            continue
+    return days
+
 def get_suspicious_ips(events):
     rejected = [e for e in events if e.get('type') == 'REJECTED' and e.get('ip')]
     ip_counts = Counter(e['ip'] for e in rejected)
@@ -325,17 +409,32 @@ def build_activity_chart(hours):
         </div>""")
     return '\n'.join(bars)
 
-def build_top_players(top):
+def build_daily_chart(days):
+    values = list(days.values())
+    max_val = max(values) if values and max(values) > 0 else 1
+    bars = []
+    for day, count in days.items():
+        pct = int((count / max_val) * 100) if max_val > 0 else 0
+        short = day[5:]  # "03-22"
+        bars.append(f"""<div class="chart-col" title="{day} - {count} joins">
+            <div class="chart-bar daily" style="height:{pct}%"><span class="chart-val">{count if count > 0 else ''}</span></div>
+            <div class="chart-label">{short}</div>
+        </div>""")
+    return '\n'.join(bars)
+
+def build_top_players(top, nicknames=None):
     if not top: return '<div class="empty">No data yet</div>'
+    if nicknames is None: nicknames = {}
     max_val = top[0][1]
     rows = []
     medals = ['&#x1F947;', '&#x1F948;', '&#x1F949;']
     for i, (player, count) in enumerate(top):
         pct = int((count / max_val) * 100)
         medal = medals[i] if i < 3 else f'#{i+1}'
+        display = format_player_name(player, nicknames)
         rows.append(f"""<div class="top-row">
             <span class="top-rank">{medal}</span>
-            <span class="top-name">{player}</span>
+            <span class="top-name">{display}</span>
             <div class="top-bar-bg"><div class="top-bar-fill" style="width:{pct}%"></div></div>
             <span class="top-count">{count}</span>
         </div>""")
@@ -348,12 +447,14 @@ def build_alerts(suspicious_ips):
         items.append(f'<div class="alert-item">&#x26A0; IP <strong>{ip}</strong> &mdash; {count} rejected attempts</div>')
     return f'<div class="alert-box">{"".join(items)}</div>'
 
-def build_whitelist_panel(wl_players):
+def build_whitelist_panel(wl_players, nicknames=None):
+    if nicknames is None: nicknames = {}
     rows = ''
     for ptype, name in sorted(wl_players, key=lambda x: x[1]):
         badge = '<span style="color:var(--blue);font-size:0.75em;">BE</span>' if ptype == 'bedrock' else '<span style="color:var(--accent);font-size:0.75em;">JE</span>'
+        display = format_player_name(name, nicknames)
         rows += f"""<div class="wl-row">
-            <span class="wl-name">{badge} {name}</span>
+            <span class="wl-name">{badge} {display}</span>
             <button class="wl-remove" onclick="removePlayer('{name}')" title="Remove">&#x2715;</button>
         </div>"""
     if not rows:
@@ -767,6 +868,7 @@ HTML_TEMPLATE = """
         .chart { display: flex; align-items: flex-end; gap: 3px; height: 120px; margin-top: 12px; }
         .chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; }
         .chart-bar { background: linear-gradient(to top, var(--chart-from), var(--chart-to)); border-radius: 3px 3px 0 0; width: 100%; min-height: 2px; display: flex; align-items: flex-start; justify-content: center; }
+        .chart-bar.daily { background: linear-gradient(to top, #0f3460, #48bfe3); }
         .chart-val { font-size: 0.65em; color: #fff; margin-top: 2px; }
         .chart-label { font-size: 0.7em; color: var(--text3); margin-top: 4px; }
 
@@ -915,8 +1017,8 @@ HTML_TEMPLATE = """
 
     <div class="panels">
         <div class="panel">
-            <h2>Activity (Last 7 Days)</h2>
-            <div class="chart">__ACTIVITY_CHART__</div>
+            <h2>Activity (Last 14 Days)</h2>
+            <div class="chart">__DAILY_CHART__</div>
         </div>
         <div class="panel">
             <h2>Top Players</h2>
@@ -1035,12 +1137,14 @@ def index():
     unique_players = len(set(e.get('player', '') for e in all_joins))
     total_rejected = len([e for e in events if e.get('type') == 'REJECTED'])
     top_players = get_top_players(events)
-    hourly = get_hourly_activity(events)
+    daily = get_daily_activity(events)
     suspicious_ips = get_suspicious_ips(events)
+    nicknames = get_nicknames()
 
     online_list = ''
     for name in sys_status.get('player_names', []):
-        online_list += f'<span class="online-player">{name}</span>'
+        display = format_player_name(name, nicknames)
+        online_list += f'<span class="online-player">{display}</span>'
     if not online_list:
         online_list = '<span style="color:var(--text3);font-size:0.85em;">No players online</span>'
 
@@ -1062,10 +1166,11 @@ def index():
         time_str = e.get('time', '')
         display_time = ts.replace('T', ' ') if 'T' in ts else f"{ts} {time_str}"
         event_type = e.get('type', 'UNKNOWN')
+        player_display = format_player_name(e.get('player', ''), nicknames)
         rows.append(f"""<tr class="row-{event_type}">
             <td>{display_time}</td>
             <td><span class="tag tag-{event_type}">{event_type}</span></td>
-            <td>{e.get('player', '')}</td>
+            <td>{player_display}</td>
             <td><span class="ip">{e.get('ip', '')}</span></td>
             <td><span class="reason">{e.get('reason', '')}</span></td>
         </tr>""")
@@ -1104,10 +1209,10 @@ def index():
     html = html.replace('__CURRENT_URL__', current_url)
     html = html.replace('__LAST_UPDATED__', now)
     html = html.replace('__VERSION__', VERSION)
-    html = html.replace('__ACTIVITY_CHART__', build_activity_chart(hourly))
-    html = html.replace('__TOP_PLAYERS__', build_top_players(top_players))
+    html = html.replace('__DAILY_CHART__', build_daily_chart(daily))
+    html = html.replace('__TOP_PLAYERS__', build_top_players(top_players, nicknames))
     html = html.replace('__ONLINE_PLAYERS_LIST__', online_list)
-    html = html.replace('__WHITELIST__', build_whitelist_panel(wl_players))
+    html = html.replace('__WHITELIST__', build_whitelist_panel(wl_players, nicknames))
     html = html.replace('__WL_COUNT__', str(len(wl_players)))
 
     html = html.replace('__VPS_UPTIME__', sys_status['vps_uptime'])

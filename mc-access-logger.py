@@ -4,8 +4,10 @@ Minecraft Server Access Logger + Metrics Collector
 Monitors Docker logs for connection attempts and collects system metrics.
 Run via cron every 5 minutes: */5 * * * * /usr/bin/python3 /home/pi/mc-access-logger.py
 
-Version: 1.2.0
+Version: 1.2.1
 Changelog:
+  v1.2.1 (2026-03-25)
+    - Fixed player count regex (Paper changed format to "out of maximum")
   v1.2.0 (2026-03-23)
     - Added system metrics collection (CPU, RAM, MC heap, TPS, player count)
     - Metrics stored in separate JSON file with 6-month retention
@@ -177,7 +179,7 @@ def collect_metrics():
 
     list_output = rcon('list')
     if list_output:
-        match = re.search(r'There are (\d+) of a max of', list_output)
+        match = re.search(r'There are (\d+)', list_output)
         metrics["players"] = int(match.group(1)) if match else 0
     else:
         metrics["players"] = 0
