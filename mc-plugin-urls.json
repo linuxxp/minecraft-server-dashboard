@@ -1,0 +1,15 @@
+{
+  "Geyser-Spigot.jar": "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
+  "floodgate-spigot.jar": "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
+  "ViaVersion.jar": "https://github.com/ViaVersion/ViaVersion/releases/download/5.8.0/ViaVersion-5.8.0.jar",
+  "ArmorStandEditor.jar": "https://cdn.modrinth.com/data/oIBGjZ77/versions/MTvYDj6T/armorstandeditor-1.21.11-50.1.jar",
+  "Bluemap.jar": "https://github.com/BlueMap-Minecraft/BlueMap/releases/download/v5.18/bluemap-5.18-paper.jar",
+  "Chunky.jar": "https://cdn.modrinth.com/data/fALzjamp/versions/P3y2MXnd/Chunky-Bukkit-1.4.40.jar",
+  "CoreProtect.jar": "https://cdn.modrinth.com/data/Lu3KuzdV/versions/HD2IvrxS/CoreProtect-CE-23.1.jar",
+  "EssentialsX.jar": "https://cdn.modrinth.com/data/hXiIvTyT/versions/SKQwLLoQ/EssentialsX-2.21.0.jar",
+  "GSit.jar": "https://github.com/gecolay/GSit/releases/download/3.2.1/GSit-3.2.1.jar",
+  "HeadsPlus.jar": "https://cdn.modrinth.com/data/5BNpeqz1/versions/XyKFFo7n/HeadsPlus-7.1.6.jar",
+  "LuckPerms.jar": "https://cdn.modrinth.com/data/Vebnzrzj/versions/OrIs0S6b/LuckPerms-Bukkit-5.5.17.jar",
+  "Worldedit.jar": "https://cdn.modrinth.com/data/1u6JkXh5/versions/JUWRHdru/worldedit-bukkit-7.4.1.jar",
+  "Worldguard.jar": "https://cdn.modrinth.com/data/DKY9btbd/versions/f9NoeotB/worldguard-bukkit-7.0.13-dist.jar"
+}
