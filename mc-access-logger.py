@@ -4,8 +4,12 @@ Minecraft Server Access Logger + Metrics Collector
 Monitors Docker logs for connection attempts and collects system metrics.
 Run via cron every 5 minutes: */5 * * * * /usr/bin/python3 /home/pi/mc-access-logger.py
 
-Version: 1.2.1
+Version: 1.3.0
 Changelog:
+  v1.3.0 (2026-05-01)
+    - Atomic JSON writes (write-tmp + os.replace) for events and metrics files
+    - Replaced bare except blocks with logging via stderr/file logger
+    - Logs to /home/pi/mc-access-logger.log (cron-friendly: stderr captured too)
   v1.2.1 (2026-03-25)
     - Fixed player count regex (Paper changed format to "out of maximum")
   v1.2.0 (2026-03-23)
@@ -21,13 +25,45 @@ import subprocess
 import re
 import os
 import json
+import logging
 import psutil
 from datetime import datetime, timedelta
 
 LOG_FILE = "/home/pi/mc-access-log.json"
 METRICS_FILE = "/home/pi/mc-metrics.json"
 STATE_FILE = "/home/pi/.mc-logger-state"
+APP_LOG_FILE = "/home/pi/mc-access-logger.log"
 METRICS_RETENTION_DAYS = 180  # 6 months
+
+# Logging — stderr (captured by cron) + file. No bare except: pass anywhere.
+_handlers = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.FileHandler(APP_LOG_FILE))
+except Exception as _e:
+    print(f"[startup] could not open log file {APP_LOG_FILE}: {_e}")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=_handlers,
+)
+log = logging.getLogger('mc-logger')
+
+def atomic_write_json(path, data, **dump_kwargs):
+    """Write JSON atomically: tmp file + fsync + os.replace."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 def strip_ansi(text):
     """Remove ANSI escape codes from text"""
@@ -40,8 +76,15 @@ def rcon(cmd):
             ['docker', 'exec', 'minecraft', 'rcon-cli', cmd],
             capture_output=True, text=True, timeout=10
         )
-        return strip_ansi(result.stdout.strip()) if result.returncode == 0 else ''
+        if result.returncode == 0:
+            return strip_ansi(result.stdout.strip())
+        log.warning("rcon non-zero: cmd=%r rc=%d stderr=%s", cmd, result.returncode, result.stderr.strip()[:200])
+        return ''
+    except subprocess.TimeoutExpired:
+        log.warning("rcon timeout: cmd=%r", cmd)
+        return ''
     except Exception:
+        log.exception("rcon exception: cmd=%r", cmd)
         return ''
 
 # --- Access Log Patterns ---
@@ -58,20 +101,34 @@ PATTERNS = {
 
 def get_last_position():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return int(f.read().strip())
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return int(f.read().strip())
+        except (ValueError, OSError):
+            log.warning("state file unreadable, restarting from 0")
+            return 0
     return 0
 
 def save_position(pos):
-    with open(STATE_FILE, 'w') as f:
-        f.write(str(pos))
+    try:
+        with open(STATE_FILE, 'w') as f:
+            f.write(str(pos))
+    except OSError:
+        log.exception("could not save state file")
 
 def get_docker_logs():
-    result = subprocess.run(
-        ['docker', 'logs', 'minecraft', '--timestamps'],
-        capture_output=True, text=True, timeout=30
-    )
-    return result.stdout.splitlines()
+    try:
+        result = subprocess.run(
+            ['docker', 'logs', 'minecraft', '--timestamps'],
+            capture_output=True, text=True, timeout=30
+        )
+        return result.stdout.splitlines()
+    except subprocess.TimeoutExpired:
+        log.warning("docker logs timeout")
+        return []
+    except Exception:
+        log.exception("docker logs failed")
+        return []
 
 def append_event(event):
     events = []
@@ -80,6 +137,7 @@ def append_event(event):
             with open(LOG_FILE, 'r') as f:
                 events = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
+            log.warning("events file unreadable; starting fresh")
             events = []
 
     events.append(event)
@@ -87,8 +145,10 @@ def append_event(event):
     if len(events) > 10000:
         events = events[-10000:]
 
-    with open(LOG_FILE, 'w') as f:
-        json.dump(events, f, indent=2, ensure_ascii=False)
+    try:
+        atomic_write_json(LOG_FILE, events, indent=2, ensure_ascii=False)
+    except Exception:
+        log.exception("could not write events file")
 
 def process_logs():
     lines = get_docker_logs()
@@ -107,7 +167,7 @@ def process_logs():
         m = PATTERNS["join"].search(line)
         if m:
             append_event({"timestamp": ts, "time": m.group(1), "type": "JOIN", "player": m.group(2), "ip": m.group(3)})
-            print(f"[JOIN] {ts} {m.group(2)} from {m.group(3)}")
+            log.info("[JOIN] %s %s from %s", ts, m.group(2), m.group(3))
             events_found += 1
             continue
 
@@ -120,7 +180,7 @@ def process_logs():
         m = PATTERNS["unknown_connect"].search(line)
         if m:
             append_event({"timestamp": ts, "time": m.group(1), "type": "REJECTED", "player": m.group(2), "ip": m.group(3), "reason": m.group(4)})
-            print(f"[REJECTED] {ts} {m.group(2)} from {m.group(3)} - {m.group(4)}")
+            log.info("[REJECTED] %s %s from %s - %s", ts, m.group(2), m.group(3), m.group(4))
             events_found += 1
             continue
 
@@ -137,7 +197,7 @@ def process_logs():
             continue
 
     save_position(len(lines))
-    print(f"Processed {len(new_lines)} new lines, found {events_found} events")
+    log.info("Processed %d new lines, found %d events", len(new_lines), events_found)
 
 # --- Metrics Collection ---
 
@@ -193,6 +253,7 @@ def save_metrics(metrics):
             with open(METRICS_FILE, 'r') as f:
                 data = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
+            log.warning("metrics file unreadable; starting fresh")
             data = []
 
     data.append(metrics)
@@ -201,10 +262,16 @@ def save_metrics(metrics):
     cutoff = (datetime.now() - timedelta(days=METRICS_RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     data = [d for d in data if d.get('ts', '') >= cutoff]
 
-    with open(METRICS_FILE, 'w') as f:
-        json.dump(data, f, separators=(',', ':'))
+    try:
+        atomic_write_json(METRICS_FILE, data, separators=(',', ':'))
+    except Exception:
+        log.exception("could not write metrics file")
+        return
 
-    print(f"Metrics saved: CPU={metrics['cpu']}% RAM={metrics['ram']}% MC_heap={metrics['mc_heap']}% TPS={metrics['tps']} Players={metrics['players']}")
+    log.info(
+        "Metrics saved: CPU=%s%% RAM=%s%% MC_heap=%s%% TPS=%s Players=%s",
+        metrics['cpu'], metrics['ram'], metrics['mc_heap'], metrics['tps'], metrics['players'],
+    )
 
 # --- Main ---
 
