@@ -4,8 +4,13 @@ Minecraft Server Access Logger + Metrics Collector
 Monitors Docker logs for connection attempts and collects system metrics.
 Run via cron every 5 minutes: */5 * * * * /usr/bin/python3 /home/pi/mc-access-logger.py
 
-Version: 1.3.0
+Version: 1.4.0
 Changelog:
+  v1.4.0 (2026-05-06)
+    - Persistent chat history: <Player> messages and [Server] broadcasts are
+      now captured to /home/pi/mc-chat-log.json (90-day retention, capped at
+      50000 messages). Dedup against last 200 entries to handle the 5-minute
+      Docker log overlap. Web app reads this instead of re-parsing logs.
   v1.3.0 (2026-05-01)
     - Atomic JSON writes (write-tmp + os.replace) for events and metrics files
     - Replaced bare except blocks with logging via stderr/file logger
@@ -31,9 +36,12 @@ from datetime import datetime, timedelta
 
 LOG_FILE = "/home/pi/mc-access-log.json"
 METRICS_FILE = "/home/pi/mc-metrics.json"
+CHAT_FILE = "/home/pi/mc-chat-log.json"
 STATE_FILE = "/home/pi/.mc-logger-state"
 APP_LOG_FILE = "/home/pi/mc-access-logger.log"
 METRICS_RETENTION_DAYS = 180  # 6 months
+CHAT_RETENTION_DAYS = 90  # 3 months
+CHAT_MAX_MESSAGES = 50000  # ceiling regardless of age
 
 # Logging — stderr (captured by cron) + file. No bare except: pass anywhere.
 _handlers = [logging.StreamHandler()]
@@ -95,6 +103,9 @@ PATTERNS = {
     "unknown_connect": re.compile(r'\[(\d{2}:\d{2}:\d{2}) INFO\]: (\S+) \(/(\d+\.\d+\.\d+\.\d+):\d+\) lost connection: (.+)'),
     "geyser_connect": re.compile(r'\[(\d{2}:\d{2}:\d{2}) INFO\]: \[Geyser-Spigot\] Player connected with username (\S+)'),
     "geyser_disconnect": re.compile(r'\[(\d{2}:\d{2}:\d{2}) INFO\]: \[Geyser-Spigot\] (\S+) has disconnected.*because of (.+)'),
+    # Chat patterns — captured into a separate persistent file
+    "chat": re.compile(r'\[(\d{2}:\d{2}:\d{2}) INFO\]: <([^>]+)> (.+)$'),
+    "chat_server": re.compile(r'\[(\d{2}:\d{2}:\d{2}) INFO\]: \[(?:Server|Not Secure\] \[Server)\] (.+)$'),
 }
 
 # --- Access Log Functions ---
@@ -150,6 +161,53 @@ def append_event(event):
     except Exception:
         log.exception("could not write events file")
 
+def append_chat_messages(new_msgs):
+    """Append a batch of chat messages, dedup against the last message
+    (Docker logs include a tail overlap each tick), enforce retention."""
+    if not new_msgs:
+        return
+    msgs = []
+    if os.path.exists(CHAT_FILE):
+        try:
+            with open(CHAT_FILE, 'r') as f:
+                msgs = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            log.warning("chat file unreadable; starting fresh")
+            msgs = []
+
+    # Dedup: skip messages already at the tail of the existing file
+    seen_keys = set()
+    if msgs:
+        # Build keys for the last 200 messages (cheap, covers most overlap)
+        for m in msgs[-200:]:
+            seen_keys.add((m.get('timestamp', ''), m.get('time', ''),
+                          m.get('sender', ''), m.get('text', '')))
+
+    added = 0
+    for m in new_msgs:
+        k = (m.get('timestamp', ''), m.get('time', ''), m.get('sender', ''), m.get('text', ''))
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        msgs.append(m)
+        added += 1
+
+    if added == 0:
+        return
+
+    # Retention: drop messages older than CHAT_RETENTION_DAYS
+    cutoff = (datetime.now() - timedelta(days=CHAT_RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    msgs = [m for m in msgs if m.get('timestamp', '') >= cutoff]
+    # And cap at CHAT_MAX_MESSAGES regardless
+    if len(msgs) > CHAT_MAX_MESSAGES:
+        msgs = msgs[-CHAT_MAX_MESSAGES:]
+
+    try:
+        atomic_write_json(CHAT_FILE, msgs, ensure_ascii=False, separators=(',', ':'))
+        log.info("chat: appended %d new messages (file has %d total)", added, len(msgs))
+    except Exception:
+        log.exception("could not write chat file")
+
 def process_logs():
     lines = get_docker_logs()
     last_pos = get_last_position()
@@ -157,6 +215,7 @@ def process_logs():
 
     today = datetime.now().strftime("%Y-%m-%d")
     events_found = 0
+    chat_batch = []  # batched chat writes — single file write per tick
 
     for line in new_lines:
         line = strip_ansi(line)
@@ -196,8 +255,27 @@ def process_logs():
             events_found += 1
             continue
 
+        # Chat — collected and persisted to a separate file
+        m = PATTERNS["chat"].search(line)
+        if m:
+            chat_batch.append({
+                "timestamp": ts, "time": m.group(1), "kind": "chat",
+                "sender": m.group(2), "text": m.group(3),
+            })
+            continue
+        m = PATTERNS["chat_server"].search(line)
+        if m:
+            chat_batch.append({
+                "timestamp": ts, "time": m.group(1), "kind": "server",
+                "sender": "Server", "text": m.group(2),
+            })
+            continue
+
     save_position(len(lines))
-    log.info("Processed %d new lines, found %d events", len(new_lines), events_found)
+    if chat_batch:
+        append_chat_messages(chat_batch)
+    log.info("Processed %d new lines, found %d events, %d chat messages",
+             len(new_lines), events_found, len(chat_batch))
 
 # --- Metrics Collection ---
 

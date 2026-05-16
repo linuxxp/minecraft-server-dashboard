@@ -1,17 +1,28 @@
-# Runtime data
-mc-access-log.json
-mc-metrics.json
-.mc-logger-state
-
 # Minecraft server data
 data/
 backups/
 
-# Python
+# OS
+.DS_Store
+Thumbs.db
+
+*.pyc
 __pycache__/
 *.pyc
 *.pyo
 
-# OS
-.DS_Store
-Thumbs.db
+# Runtime files (do NOT commit — these contain user data and secrets)
+mc-access-log.json
+mc-metrics.json
+mc-chat-log.json
+mc-onboarding-state.json
+mc-locations.json
+mc-plugin-history.json
+.mc-web-secret
+.mc-logger-state
+mc-access-web.log
+mc-access-logger.log
+
+# Local IDE
+.vscode/
+.idea/
