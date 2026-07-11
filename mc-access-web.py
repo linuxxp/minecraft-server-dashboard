@@ -3,8 +3,29 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 2.0.0
+Version: 2.1.0
 Changelog:
+  v2.1.0 (2026-07-11)
+    - Backups: "Backup now" button on /backups (save-off -> save-all flush ->
+      tar -> save-on, runs in a background thread with live status) and a
+      per-row Delete button (filename validated, confined to BACKUP_DIR).
+    - Auto-ban + /bans page: IPs whose REJECTED count reaches
+      AUTO_BAN_THRESHOLD (default 20) are banned automatically by the
+      watchdog thread. Ban method: `sudo -n ufw insert 1 deny from <ip>`
+      when sudoers allows it, otherwise falls back to RCON `ban-ip`.
+      Never auto-bans an IP that ever had a successful JOIN, nor private
+      ranges. /bans lists all bans with country (ip-api.com lookup at ban
+      time), reason, date and method, with manual ban/unban.
+    - Player quick actions on /players: kick (+reason), ban/pardon, gamemode,
+      op/de-op in a new "Actions" tab of the player modal.
+    - RCON console at /console: free-form command with confirmation for
+      dangerous commands, full command log (who/what/result) in the app log.
+      No new attack surface: dashboard credentials already carried
+      RCON-equivalent power via existing endpoints.
+    - Whitelist ON/OFF indicator in the dashboard whitelist panel (reads
+      server.properties, refreshed by the 5s poller).
+    - Storage trend chart on /charts: disk %, world GB and backups GB from
+      the new logger v2.1.0 metrics fields.
   v2.0.0 (2026-07-11)
     - SECURITY: credentials moved out of the source code into an auth file
       (default /home/pi/mc-web-auth.json, override with MC_WEB_AUTH_FILE).
@@ -244,6 +265,7 @@ import secrets
 import logging
 import functools
 import subprocess
+import threading
 import psutil
 from datetime import datetime, timedelta, timezone
 from collections import Counter
@@ -325,9 +347,15 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
+
+# Auto-ban: IPs that accumulate this many REJECTED events get firewalled by
+# the watchdog thread. IPs that ever had a successful JOIN are never
+# auto-banned (a kid retrying a wrong name shouldn't brick their home IP).
+AUTO_BAN_ENABLED = True
+AUTO_BAN_THRESHOLD = 20
 
 # ----------------------------------------------------------------------------
 # Credentials — never hardcoded in the source. Resolution order:
@@ -885,6 +913,19 @@ def get_system_status():
 
     return status
 
+def get_whitelist_enabled():
+    """Read whitelist state from server.properties (kept in sync by the
+    `whitelist on/off` command). Returns True/False, or None if unreadable."""
+    try:
+        with open(os.path.join(WORLD_DIR, 'server.properties'), 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('white-list='):
+                    return line.split('=', 1)[1].strip().lower() == 'true'
+    except Exception:
+        log.debug("server.properties read failed", exc_info=True)
+    return None
+
 def get_whitelist():
     players = []
     wl_path = os.path.join(WORLD_DIR, 'whitelist.json')
@@ -1033,16 +1074,17 @@ def process_onboarding():
     }
 
 # ----------------------------------------------------------------------------
-# Onboarding watchdog — the state machine above is also ticked on page loads,
+# Watchdog — the onboarding state machine above is also ticked on page loads,
 # but if the admin closes the browser mid-onboarding nothing would ever
 # re-enable the whitelist. This background thread guarantees the window closes
 # (and the player gets auto-whitelisted on join) regardless of open pages.
+# It also runs the auto-ban sweep (see the Bans section further down).
 # ----------------------------------------------------------------------------
 ONBOARDING_WATCHDOG_INTERVAL = 30  # seconds
 
 _watchdog_started = False
 
-def _start_onboarding_watchdog():
+def _start_watchdog():
     global _watchdog_started
     if _watchdog_started:
         return
@@ -1056,13 +1098,17 @@ def _start_onboarding_watchdog():
                     process_onboarding()
             except Exception:
                 log.exception("onboarding watchdog tick failed")
+            try:
+                auto_ban_tick()
+            except Exception:
+                log.exception("auto-ban tick failed")
 
-    import threading
-    t = threading.Thread(target=_tick_forever, daemon=True, name='onboarding-watchdog')
+    t = threading.Thread(target=_tick_forever, daemon=True, name='watchdog')
     t.start()
-    log.info("onboarding watchdog started (interval %ds)", ONBOARDING_WATCHDOG_INTERVAL)
+    log.info("watchdog started (interval %ds, auto-ban %s)",
+             ONBOARDING_WATCHDOG_INTERVAL, 'on' if AUTO_BAN_ENABLED else 'off')
 
-_start_onboarding_watchdog()
+_start_watchdog()
 
 def get_top_players(events, limit=10):
     joins = [e.get('player', '') for e in events if e.get('type') == 'JOIN' and e.get('player')]
@@ -1470,6 +1516,58 @@ def api_nick():
 
     return _respond(f'{name}: {action}. {result}', toast='success')
 
+# ----------------------------------------------------------------------------
+# Player quick actions — kick / ban / pardon / gamemode / op / deop.
+# One endpoint with a strict action whitelist; every command is regex-guarded
+# before it reaches RCON.
+# ----------------------------------------------------------------------------
+GAMEMODES = ('survival', 'creative', 'adventure', 'spectator')
+KICK_REASON_RE = re.compile(r'^[^\x00-\x1f\x7f]{0,100}$')
+
+@app.route('/api/player/action', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_player_action():
+    name = request.form.get('name', '').strip()
+    action = request.form.get('action', '').strip().lower()
+    arg = request.form.get('arg', '').strip()
+
+    if not name or not PLAYER_NAME_RE.match(name.lstrip('.')):
+        return _respond('Bad player name', toast='error')
+
+    if action == 'kick':
+        if arg and not KICK_REASON_RE.match(arg):
+            return _respond('Bad kick reason', toast='error')
+        cmd = f'kick {name} {arg}'.strip()
+        label = 'kicked'
+    elif action == 'ban':
+        if arg and not KICK_REASON_RE.match(arg):
+            return _respond('Bad ban reason', toast='error')
+        cmd = f'ban {name} {arg}'.strip()
+        label = 'banned'
+    elif action == 'pardon':
+        cmd = f'pardon {name}'
+        label = 'pardoned (unbanned)'
+    elif action == 'gamemode':
+        if arg not in GAMEMODES:
+            return _respond('Bad gamemode', toast='error')
+        cmd = f'gamemode {arg} {name}'
+        label = f'gamemode set to {arg}'
+    elif action == 'op':
+        cmd = f'op {name}'
+        label = 'given OP'
+    elif action == 'deop':
+        cmd = f'deop {name}'
+        label = 'OP removed'
+    else:
+        return _respond('Unknown action', toast='error')
+
+    result = rcon(cmd)
+    log.info("player action: cmd=%r result=%r", cmd, result)
+    if result.startswith('Error'):
+        return _respond(f'{action} failed: {result}', toast='error')
+    return _respond(f'{name}: {label}. {result or "OK"}', toast='success')
+
 @app.route('/api/detect-platform')
 @requires_auth
 def api_detect_platform():
@@ -1560,6 +1658,7 @@ def api_status():
         'event_count': len(events),
         'recent_events': recent,
         'onboarding': onboarding_payload,
+        'whitelist_on': get_whitelist_enabled(),
     }), 200, {'Content-Type': 'application/json'}
 
 def _hours_since_backup(backup_date_str):
@@ -1696,6 +1795,8 @@ CHARTS_TEMPLATE = """
             <a href="/backups" class="btn">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
     </div>
@@ -1719,6 +1820,15 @@ CHARTS_TEMPLATE = """
 
     <div class="legend-info">
         Data collected every 5 minutes. CPU, RAM, MC heap and Swap are in %. TPS is 0-20 (shown as 0-100% scale). Players shown as count.
+    </div>
+
+    <h2 style="color:var(--accent);margin-top:30px;font-size:1.2em;">&#x1F4BE; Storage Trend</h2>
+    <div class="chart-container" style="margin-top:14px;">
+        <canvas id="storageChart" height="90"></canvas>
+        <div class="loading" id="storageMsg" style="display:none;">No storage data yet — requires logger v2.1.0+ (fields appear after its next runs).</div>
+    </div>
+    <div class="legend-info">
+        Disk usage in %, world size and total backup archive size in GB. Collected by the logger since v2.1.0 — older data points show as gaps.
     </div>
 
     <h2 style="color:var(--accent);margin-top:30px;font-size:1.2em;">&#x1F465; Per-Player Playtime</h2>
@@ -1757,14 +1867,16 @@ CHARTS_TEMPLATE = """
         }
 
         function updateChartColors() {
-            if (!metricsChart) return;
             var c = getColors();
-            metricsChart.options.scales.y.grid.color = c.grid;
-            metricsChart.options.scales.x.grid.color = c.grid;
-            metricsChart.options.scales.y.ticks.color = c.text;
-            metricsChart.options.scales.x.ticks.color = c.text;
-            metricsChart.options.scales.y2.ticks.color = c.text;
-            metricsChart.update();
+            [window.metricsChart, window.storageChart].forEach(function(ch) {
+                if (!ch) return;
+                ch.options.scales.y.grid.color = c.grid;
+                ch.options.scales.x.grid.color = c.grid;
+                ch.options.scales.y.ticks.color = c.text;
+                ch.options.scales.x.ticks.color = c.text;
+                ch.options.scales.y2.ticks.color = c.text;
+                ch.update();
+            });
         }
 
         function loadData(days, btn) {
@@ -1779,10 +1891,74 @@ CHARTS_TEMPLATE = """
                 .then(function(data) {
                     document.getElementById('loadingMsg').style.display = 'none';
                     renderChart(data);
+                    renderStorage(data);
                 })
                 .catch(function(err) {
                     document.getElementById('loadingMsg').textContent = 'Error loading data: ' + err;
                 });
+        }
+
+        var storageChart = null;
+        function renderStorage(data) {
+            var c = getColors();
+            var msg = document.getElementById('storageMsg');
+            var hasData = data.some(function(d) { return d.disk != null || d.world_gb != null || d.backups_gb != null; });
+            msg.style.display = hasData ? 'none' : 'block';
+            var labels = data.map(function(d) { return d.ts; });
+            var pick = function(field) { return data.map(function(d) { return d[field] != null ? d[field] : null; }); };
+            var datasets = [
+                { label: 'Disk %', data: pick('disk'), borderColor: c.ram, backgroundColor: c.ram + '20', borderWidth: 1.5, pointRadius: 0, tension: 0.3, spanGaps: true, yAxisID: 'y' },
+                { label: 'World GB', data: pick('world_gb'), borderColor: c.mc_heap, backgroundColor: c.mc_heap + '20', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true, yAxisID: 'y2' },
+                { label: 'Backups GB', data: pick('backups_gb'), borderColor: c.tps, backgroundColor: c.tps + '20', borderWidth: 2, pointRadius: 0, tension: 0.3, spanGaps: true, yAxisID: 'y2' }
+            ];
+            if (storageChart) storageChart.destroy();
+            var ctx = document.getElementById('storageChart').getContext('2d');
+            storageChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { position: 'top', labels: { usePointStyle: true, padding: 15, color: c.text, font: { size: 12 } } },
+                        tooltip: {
+                            callbacks: {
+                                title: function(items) { return items[0].label.replace('T', ' '); },
+                                label: function(item) {
+                                    if (item.dataset.label === 'Disk %') return 'Disk: ' + item.raw.toFixed(1) + '%';
+                                    return item.dataset.label + ': ' + item.raw.toFixed(2) + ' GB';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: c.grid },
+                            ticks: { color: c.text, maxTicksLimit: 12, maxRotation: 0,
+                                callback: function(val) {
+                                    var label = this.getLabelForValue(val);
+                                    if (!label) return '';
+                                    var parts = label.split('T');
+                                    return parts.length === 2 ? parts[1].substring(0, 5) : label;
+                                }
+                            }
+                        },
+                        y: {
+                            position: 'left', min: 0, max: 100,
+                            grid: { color: c.grid },
+                            ticks: { color: c.text, callback: function(v) { return v + '%'; } },
+                            title: { display: true, text: 'Disk %', color: c.text }
+                        },
+                        y2: {
+                            position: 'right', min: 0,
+                            grid: { drawOnChartArea: false },
+                            ticks: { color: c.text },
+                            title: { display: true, text: 'GB', color: c.text }
+                        }
+                    }
+                }
+            });
         }
 
         function renderChart(data) {
@@ -2544,6 +2720,184 @@ def api_locations_remove():
     return _respond(f'Removed "{name}"', toast='success')
 
 # ----------------------------------------------------------------------------
+# Bans — firewall-level IP bans with a persisted list (IP, country, reason,
+# date, method). Ban method preference:
+#   1. `sudo -n ufw insert 1 deny from <ip>` — blocks at the firewall, before
+#      the packet ever reaches the Minecraft port. Needs a sudoers entry:
+#        yourusername ALL=(root) NOPASSWD: /usr/sbin/ufw
+#   2. RCON `ban-ip` fallback — works without root but only blocks the game.
+# The watchdog thread auto-bans IPs whose REJECTED count reaches
+# AUTO_BAN_THRESHOLD, unless that IP ever had a successful JOIN.
+# ----------------------------------------------------------------------------
+BANNED_IPS_FILE = "/home/pi/mc-banned-ips.json"
+IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+def _is_private_ip(ip):
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return True  # malformed -> treat as unbannable
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return True
+    if a in (10, 127):
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 169 and b == 254:
+        return True
+    return False
+
+def load_banned_ips():
+    if os.path.exists(BANNED_IPS_FILE):
+        try:
+            with open(BANNED_IPS_FILE, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            log.exception("banned ips read failed")
+    return []
+
+def save_banned_ips(bans):
+    try:
+        atomic_write_json(BANNED_IPS_FILE, bans, indent=2)
+    except Exception:
+        log.exception("banned ips write failed")
+
+def lookup_ip_country(ip):
+    """Country lookup via ip-api.com (free tier, no key). Called once per ban
+    and stored in the record, so rate limits are a non-issue."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f'http://ip-api.com/json/{ip}?fields=status,country,countryCode',
+            headers={'User-Agent': f'mc-access-web/{VERSION}'},
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            if data.get('status') == 'success':
+                return data.get('country', ''), data.get('countryCode', '')
+    except Exception:
+        log.debug("country lookup failed for %s", ip, exc_info=True)
+    return '', ''
+
+def _fw_ban(ip):
+    """Ban an IP. Returns (method, detail). Tries ufw first, falls back to RCON."""
+    try:
+        r = subprocess.run(['sudo', '-n', 'ufw', 'insert', '1', 'deny', 'from', ip, 'to', 'any'],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return 'ufw', (r.stdout or '').strip()[:100]
+        # `insert 1` fails on an empty ruleset; plain deny appends instead
+        r = subprocess.run(['sudo', '-n', 'ufw', 'deny', 'from', ip, 'to', 'any'],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return 'ufw', (r.stdout or '').strip()[:100]
+        log.warning("ufw ban failed for %s rc=%d stderr=%s (sudoers entry missing?)",
+                    ip, r.returncode, (r.stderr or '').strip()[:200])
+    except Exception:
+        log.exception("ufw ban failed for %s", ip)
+    result = rcon(f'ban-ip {ip}')
+    return 'rcon', (result or '')[:100]
+
+def _fw_unban(ip, method):
+    """Undo a ban made by _fw_ban. Returns detail string."""
+    if method == 'ufw':
+        try:
+            r = subprocess.run(['sudo', '-n', 'ufw', 'delete', 'deny', 'from', ip, 'to', 'any'],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return (r.stdout or 'ufw rule deleted').strip()[:100]
+            log.warning("ufw unban failed for %s rc=%d stderr=%s", ip, r.returncode,
+                        (r.stderr or '').strip()[:200])
+            return f'ufw delete failed: {(r.stderr or "").strip()[:80]}'
+        except Exception:
+            log.exception("ufw unban failed for %s", ip)
+            return 'ufw delete failed'
+    result = rcon(f'pardon-ip {ip}')
+    return (result or 'pardoned')[:100]
+
+def _ban_ip(ip, source, reason):
+    """Ban + record. Returns (ok, message). Caller must ensure not already banned."""
+    method, detail = _fw_ban(ip)
+    country, cc = lookup_ip_country(ip)
+    bans = load_banned_ips()
+    bans.append({
+        'ip': ip,
+        'country': country,
+        'country_code': cc,
+        'source': source,          # 'auto' | 'manual'
+        'reason': reason,
+        'method': method,          # 'ufw' | 'rcon'
+        'banned_at': datetime.now().replace(microsecond=0).isoformat(),
+        'detail': detail,
+    })
+    save_banned_ips(bans)
+    log.info("banned ip=%s method=%s source=%s reason=%r country=%s", ip, method, source, reason, country)
+    return True, f'{ip} banned via {method}' + (f' ({country})' if country else '')
+
+def auto_ban_tick():
+    """Called by the watchdog every 30s: firewall IPs with too many rejects."""
+    if not AUTO_BAN_ENABLED:
+        return
+    events = load_events()
+    rejected = Counter(e['ip'] for e in events if e.get('type') == 'REJECTED' and e.get('ip'))
+    if not rejected:
+        return
+    joined_ips = set(e.get('ip', '') for e in events if e.get('type') == 'JOIN' and e.get('ip'))
+    banned_set = set(b.get('ip') for b in load_banned_ips())
+    for ip, count in rejected.items():
+        if count < AUTO_BAN_THRESHOLD:
+            continue
+        if ip in banned_set or ip in joined_ips:
+            continue
+        if not IP_RE.match(ip) or _is_private_ip(ip):
+            continue
+        _ban_ip(ip, source='auto', reason=f'{count} rejected connection attempts')
+
+@app.route('/api/bans')
+@requires_auth
+def api_bans_list():
+    bans = load_banned_ips()
+    # Newest first
+    bans = sorted(bans, key=lambda b: b.get('banned_at', ''), reverse=True)
+    return json.dumps(bans), 200, {'Content-Type': 'application/json'}
+
+@app.route('/api/bans/add', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_bans_add():
+    ip = request.form.get('ip', '').strip()
+    reason = request.form.get('reason', '').strip()[:100]
+    if not IP_RE.match(ip):
+        return _respond('Bad IP address', redirect_to='/bans', toast='error')
+    if _is_private_ip(ip):
+        return _respond('Refusing to ban a private/local IP', redirect_to='/bans', toast='error')
+    if any(b.get('ip') == ip for b in load_banned_ips()):
+        return _respond(f'{ip} is already banned', redirect_to='/bans', toast='warning')
+    _ok, msg = _ban_ip(ip, source='manual', reason=reason or 'manual ban')
+    return _respond(msg, redirect_to='/bans', toast='success')
+
+@app.route('/api/bans/remove', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_bans_remove():
+    ip = request.form.get('ip', '').strip()
+    if not IP_RE.match(ip):
+        return _respond('Bad IP address', redirect_to='/bans', toast='error')
+    bans = load_banned_ips()
+    record = next((b for b in bans if b.get('ip') == ip), None)
+    if not record:
+        return _respond(f'{ip} is not in the ban list', redirect_to='/bans', toast='warning')
+    detail = _fw_unban(ip, record.get('method', 'rcon'))
+    save_banned_ips([b for b in bans if b.get('ip') != ip])
+    log.info("unbanned ip=%s detail=%r", ip, detail)
+    return _respond(f'{ip} unbanned ({detail})', redirect_to='/bans', toast='success')
+
+# ----------------------------------------------------------------------------
 # Chat — reads persisted chat history from /home/pi/mc-chat-log.json (written
 # by mc-access-logger.py every 5 minutes). Long retention (90 days), cap 50k.
 # Also forwards admin messages to in-game chat via the `say` RCON command.
@@ -2857,6 +3211,8 @@ PLUGINS_TEMPLATE = """
             <a href="/backups" class="btn">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <button id="updateAllBtn" class="btn btn-update">&#x21BB; Update All</button>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
@@ -3280,6 +3636,8 @@ PLAYERS_TEMPLATE = """
             <a href="/backups" class="btn">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
     </div>
@@ -3295,6 +3653,7 @@ PLAYERS_TEMPLATE = """
             <div class="modal-tabs">
                 <div class="modal-tab" data-tab="teleport" onclick="switchModalTab('teleport')">&#x1F4CD; Teleport</div>
                 <div class="modal-tab" data-tab="nick" onclick="switchModalTab('nick')">&#x270F;&#xFE0F; Nickname</div>
+                <div class="modal-tab" data-tab="actions" onclick="switchModalTab('actions')">&#x26A1; Actions</div>
             </div>
             <div class="modal-section" id="teleportSection">
                 <label>To player (leave empty to use coordinates):</label>
@@ -3323,6 +3682,31 @@ PLAYERS_TEMPLATE = """
                 <label>New nickname (1-24 chars):</label>
                 <input type="text" id="nickValue" placeholder="e.g. Ivancho" maxlength="24">
                 <div class="modal-help">Letters, digits, spaces, dash and underscore. Empty / Reset removes the nickname.</div>
+            </div>
+            <div class="modal-section" id="actionsSection">
+                <label>Gamemode:</label>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <select id="qaGamemode" style="flex:1;min-width:130px;background:var(--bg3);color:var(--text);border:1px solid var(--border2);padding:8px 12px;border-radius:6px;font-size:0.95em;">
+                        <option value="survival">survival</option>
+                        <option value="creative">creative</option>
+                        <option value="adventure">adventure</option>
+                        <option value="spectator">spectator</option>
+                    </select>
+                    <button type="button" class="modal-btn" onclick="quickAction('gamemode', document.getElementById('qaGamemode').value)">Apply</button>
+                </div>
+                <label style="margin-top:14px;">Kick (optional reason):</label>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <input type="text" id="qaKickReason" placeholder="Reason..." maxlength="100" style="flex:1;min-width:130px;">
+                    <button type="button" class="modal-btn danger" onclick="if(confirm('Kick ' + modalState.player + '?'))quickAction('kick', document.getElementById('qaKickReason').value)">Kick</button>
+                </div>
+                <label style="margin-top:14px;">Moderation:</label>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <button type="button" class="modal-btn danger" onclick="if(confirm('Ban ' + modalState.player + ' from the server?'))quickAction('ban','')">&#x1F528; Ban</button>
+                    <button type="button" class="modal-btn" onclick="quickAction('pardon','')">Pardon</button>
+                    <button type="button" class="modal-btn danger" onclick="if(confirm('Give OP to ' + modalState.player + '? An OP can run ANY server command!'))quickAction('op','')">&#x2B50; OP</button>
+                    <button type="button" class="modal-btn" onclick="quickAction('deop','')">De-op</button>
+                </div>
+                <div class="modal-help">Kick and gamemode require the player to be online. Ban blocks the account (Pardon lifts it). IP bans live on the <a href="/bans" style="color:var(--blue);">Bans</a> page.</div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="modal-btn" onclick="closeModal()">Cancel</button>
@@ -3354,6 +3738,7 @@ PLAYERS_TEMPLATE = """
 
         function openTeleport(name) { openModal(name, 'teleport'); }
         function openNick(name) { openModal(name, 'nick'); }
+        function openActions(name) { openModal(name, 'actions'); }
 
         function openModal(name, tab) {
             modalState.player = name;
@@ -3378,8 +3763,20 @@ PLAYERS_TEMPLATE = """
             });
             document.getElementById('teleportSection').classList.toggle('active', tab === 'teleport');
             document.getElementById('nickSection').classList.toggle('active', tab === 'nick');
+            document.getElementById('actionsSection').classList.toggle('active', tab === 'actions');
             document.getElementById('modalSecondaryBtn').style.display = (tab === 'nick') ? 'inline-block' : 'none';
             document.getElementById('modalSecondaryBtn').textContent = 'Reset nickname';
+            // Quick-action rows carry their own buttons — no global Apply there
+            document.getElementById('modalPrimaryBtn').style.display = (tab === 'actions') ? 'none' : 'inline-block';
+        }
+
+        function quickAction(action, arg) {
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fd.append('name', modalState.player);
+            fd.append('action', action);
+            fd.append('arg', arg || '');
+            postAction('/api/player/action', fd);
         }
 
         function setCoords(x, y, z) {
@@ -3585,6 +3982,112 @@ def get_backups_list():
         log.exception("backup listing failed")
     return list(reversed(backups))  # newest first
 
+# ----------------------------------------------------------------------------
+# Backup now / delete — tar of the world dirs into BACKUP_DIR, same naming
+# scheme as the host cron job (world-*.tar.gz). Runs in a background thread
+# (multi-GB worlds take minutes); saving is paused around the tar so region
+# files don't change mid-archive.
+# ----------------------------------------------------------------------------
+BACKUP_NAME_RE = re.compile(r'^world-[A-Za-z0-9._-]{1,80}\.tar\.gz$')
+
+_backup_state = {'running': False, 'started_at': '', 'finished_at': '', 'ok': None, 'message': ''}
+_backup_lock = threading.Lock()
+
+def _run_backup_job(filename):
+    global _backup_state
+    dest = os.path.join(BACKUP_DIR, filename)
+    ok = False
+    message = ''
+    try:
+        rcon('save-off')
+        rcon('save-all flush')
+        time.sleep(3)  # give the flush a moment to hit disk
+        dirs = [w for w in ('world', 'world_nether', 'world_the_end')
+                if os.path.isdir(os.path.join(WORLD_DIR, w))]
+        if not dirs:
+            message = f'No world directories found in {WORLD_DIR}'
+        else:
+            r = subprocess.run(['tar', '-czf', dest, '-C', WORLD_DIR] + dirs,
+                               capture_output=True, text=True, timeout=3600)
+            # tar exits 1 for "file changed as we read it" — with save-off that
+            # should not happen, but a partial-warning archive is still usable.
+            if r.returncode in (0, 1) and os.path.exists(dest) and os.path.getsize(dest) > 0:
+                ok = True
+                message = f'Backup created: {filename} ({format_size(os.path.getsize(dest))})'
+                if r.returncode == 1:
+                    message += ' (tar reported warnings)'
+            else:
+                message = f'tar failed (rc={r.returncode}): {(r.stderr or "")[:200]}'
+                if os.path.exists(dest):
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        log.exception("could not remove failed backup %s", dest)
+    except Exception as e:
+        log.exception("backup job failed")
+        message = f'Backup failed: {e}'
+        if os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+    finally:
+        rcon('save-on')
+    with _backup_lock:
+        _backup_state.update({
+            'running': False,
+            'finished_at': datetime.now().replace(microsecond=0).isoformat(),
+            'ok': ok, 'message': message,
+        })
+    log.info("backup job done: ok=%s message=%r", ok, message)
+
+@app.route('/api/backups/create', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_backups_create():
+    global _backup_state
+    with _backup_lock:
+        if _backup_state['running']:
+            return _respond('A backup is already running', redirect_to='/backups', toast='warning')
+        filename = f"world-{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.tar.gz"
+        _backup_state = {
+            'running': True,
+            'started_at': datetime.now().replace(microsecond=0).isoformat(),
+            'finished_at': '', 'ok': None, 'message': f'Backing up to {filename}...',
+        }
+    threading.Thread(target=_run_backup_job, args=(filename,), daemon=True, name='backup-job').start()
+    log.info("backup job started: %s", filename)
+    return _respond(f'Backup started ({filename}). This can take a few minutes.',
+                    redirect_to='/backups', toast='info')
+
+@app.route('/api/backups/status')
+@requires_auth
+def api_backups_status():
+    with _backup_lock:
+        state = dict(_backup_state)
+    return json.dumps(state), 200, {'Content-Type': 'application/json'}
+
+@app.route('/api/backups/delete', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_backups_delete():
+    filename = request.form.get('filename', '').strip()
+    if not filename or not BACKUP_NAME_RE.match(filename):
+        return _respond('Bad backup filename', redirect_to='/backups', toast='error')
+    path = os.path.realpath(os.path.join(BACKUP_DIR, filename))
+    if not path.startswith(os.path.realpath(BACKUP_DIR) + os.sep):
+        return _respond('Bad backup path', redirect_to='/backups', toast='error')
+    if not os.path.exists(path):
+        return _respond(f'{filename} not found', redirect_to='/backups', toast='warning')
+    size = os.path.getsize(path)
+    try:
+        os.remove(path)
+    except OSError as e:
+        log.exception("backup delete failed: %s", path)
+        return _respond(f'Delete failed: {e}', redirect_to='/backups', toast='error')
+    log.info("backup deleted: %s (%s)", filename, format_size(size))
+    return _respond(f'Deleted {filename} ({format_size(size)})', redirect_to='/backups', toast='success')
+
 @app.route('/backups')
 @requires_auth
 def backups_page():
@@ -3654,9 +4157,10 @@ def backups_page():
             <td>{delta_html}</td>
             <td>{esc(b['mtime'])}</td>
             <td>{esc(b['age_human'])} ago</td>
+            <td><button class="bk-delete" data-filename="{esc(b['filename'])}" title="Delete this backup">&#x1F5D1;</button></td>
         </tr>"""
     if not cards:
-        cards = '<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:30px;">No backup files found in ' + esc(BACKUP_DIR) + '</td></tr>'
+        cards = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:30px;">No backup files found in ' + esc(BACKUP_DIR) + '</td></tr>'
 
     summary = (
         f'<div class="backup-summary">'
@@ -3725,6 +4229,23 @@ BACKUPS_TEMPLATE = """
 
         .backup-dir-info { color: var(--text3); font-size: 0.82em; margin-top: 16px; padding: 10px 12px; background: var(--bg2); border-radius: 8px; }
         .backup-dir-info code { color: var(--blue); }
+
+        .btn-backup-now { color: var(--blue); border-color: var(--blue); }
+        .btn-backup-now:hover { background: var(--blue); color: var(--bg); }
+        .btn-backup-now:disabled { opacity: 0.5; cursor: wait; }
+        .bk-delete { background: none; border: 1px solid var(--red); color: var(--red); cursor: pointer; font-size: 0.9em; padding: 3px 9px; border-radius: 4px; }
+        .bk-delete:hover { background: var(--red); color: #fff; }
+        .backup-progress { display: none; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 0.95em; background: var(--msg-bg); color: var(--blue); border: 1px solid var(--blue); }
+        .backup-progress .spin { display: inline-block; animation: bkspin 1.2s linear infinite; }
+        @keyframes bkspin { to { transform: rotate(360deg); } }
+
+        #toastContainer { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 10px; z-index: 9999; max-width: 360px; pointer-events: none; }
+        .toast { pointer-events: auto; padding: 12px 16px; border-radius: 8px; font-size: 0.9em; color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.3); display: flex; align-items: flex-start; gap: 10px; }
+        .toast.toast-success { background: #2d8f6f; }
+        .toast.toast-error { background: #c0392b; }
+        .toast.toast-warning { background: #d4a017; color: #1a1a2e; }
+        .toast.toast-info { background: #2980b9; }
+        .toast .toast-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 1.2em; line-height: 1; opacity: 0.7; padding: 0; margin-left: auto; }
     </style>
     <script>(function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.documentElement.setAttribute('data-theme',t);})();
         function toggleTheme() { var h=document.documentElement; var n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
@@ -3743,24 +4264,112 @@ BACKUPS_TEMPLATE = """
             <a href="/players" class="btn">&#x1F465; Players</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
+            <button id="backupNowBtn" class="btn btn-backup-now">&#x1F4E6; Backup now</button>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
     </div>
     __MSG__
+    <div class="backup-progress" id="backupProgress"><span class="spin">&#x21BB;</span> <span id="backupProgressText">Backup running...</span></div>
     __STATUS__
     __SUMMARY__
     <table>
         <thead>
-            <tr><th>Filename</th><th>Size</th><th>&Delta; vs prev</th><th>Created</th><th>Age</th></tr>
+            <tr><th>Filename</th><th>Size</th><th>&Delta; vs prev</th><th>Created</th><th>Age</th><th></th></tr>
         </thead>
         <tbody>__ROWS__</tbody>
     </table>
     <div class="backup-dir-info">
-        Backups are created by the host's backup cron job (outside this app). To restore a backup:
+        Backups can be created by the host's backup cron job or with the <strong>Backup now</strong> button
+        (world saving is paused during the archive). To restore a backup:
         stop the server (<code>docker compose down</code>), extract the chosen tarball into the world directory, then start again.
         <br>v__VERSION__
     </div>
-    <script>(function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();</script>
+
+    <div id="toastContainer"></div>
+
+    <script>
+        var CSRF_TOKEN = '__CSRF__';
+
+        function showToast(msg, type) {
+            type = type || 'info';
+            var c = document.getElementById('toastContainer');
+            var t = document.createElement('div');
+            t.className = 'toast toast-' + type;
+            t.innerHTML = '<span></span><button class="toast-close" type="button">&#x2715;</button>';
+            t.firstChild.textContent = msg;
+            t.querySelector('.toast-close').addEventListener('click', function(){ t.remove(); });
+            c.appendChild(t);
+            setTimeout(function(){ if (t.parentNode) t.remove(); }, 8000);
+        }
+
+        var pollTimer = null;
+        function pollBackupStatus() {
+            fetch('/api/backups/status', { headers: { 'X-Requested-With': 'fetch' } })
+                .then(function(r){ return r.json(); })
+                .then(function(s) {
+                    var box = document.getElementById('backupProgress');
+                    var btn = document.getElementById('backupNowBtn');
+                    if (s.running) {
+                        box.style.display = 'block';
+                        document.getElementById('backupProgressText').textContent = s.message || 'Backup running...';
+                        btn.disabled = true;
+                        if (!pollTimer) pollTimer = setInterval(pollBackupStatus, 3000);
+                    } else {
+                        btn.disabled = false;
+                        if (pollTimer) {
+                            // A poll cycle was active -> a backup just finished
+                            clearInterval(pollTimer); pollTimer = null;
+                            box.style.display = 'none';
+                            showToast(s.message || 'Backup finished', s.ok ? 'success' : 'error');
+                            if (s.ok) setTimeout(function(){ location.reload(); }, 1500);
+                        } else {
+                            box.style.display = 'none';
+                        }
+                    }
+                })
+                .catch(function(){});
+        }
+
+        document.getElementById('backupNowBtn').addEventListener('click', function() {
+            if (!confirm('Create a backup now? World saving will be paused while the archive is written.')) return;
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fetch('/api/backups/create', {
+                method: 'POST', body: fd,
+                headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+            }).then(function(r){ return r.json(); })
+              .then(function(d) {
+                  showToast(d.message || 'Backup started', d.toast || 'info');
+                  if (!pollTimer) pollTimer = setInterval(pollBackupStatus, 3000);
+                  pollBackupStatus();
+              }).catch(function(err){ showToast('Network: ' + err, 'error'); });
+        });
+
+        document.querySelectorAll('.bk-delete').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var fn = btn.dataset.filename;
+                if (!confirm('Delete backup "' + fn + '"? This cannot be undone.')) return;
+                var fd = new FormData();
+                fd.append('csrf_token', CSRF_TOKEN);
+                fd.append('filename', fn);
+                fetch('/api/backups/delete', {
+                    method: 'POST', body: fd,
+                    headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+                }).then(function(r){ return r.json(); })
+                  .then(function(d) {
+                      showToast(d.message || 'Done', d.toast || 'info');
+                      if (d.ok) setTimeout(function(){ location.reload(); }, 1200);
+                  }).catch(function(err){ showToast('Network: ' + err, 'error'); });
+            });
+        });
+
+        // If a backup is already running when the page opens, show progress
+        pollBackupStatus();
+
+        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+    </script>
 </body>
 </html>
 """
@@ -3842,6 +4451,8 @@ LOGS_TEMPLATE = """
             <a href="/backups" class="btn">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
     </div>
@@ -3973,6 +4584,372 @@ LOGS_TEMPLATE = """
 """
 
 # ----------------------------------------------------------------------------
+# RCON console — free-form command execution. This adds no new attack surface:
+# dashboard credentials already carry RCON-equivalent power through the
+# whitelist / teleport / restart / say endpoints. Every command is logged
+# with the client IP. Client-side confirmation for destructive commands.
+# ----------------------------------------------------------------------------
+CONSOLE_CMD_RE = re.compile(r'^[^\x00-\x1f\x7f]{1,200}$')
+
+@app.route('/api/console', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_console():
+    cmd = request.form.get('cmd', '').strip().lstrip('/')
+    if not cmd or not CONSOLE_CMD_RE.match(cmd):
+        return {'ok': False, 'output': 'Invalid command (1-200 printable characters)'}, 200
+    result = rcon(cmd)
+    log.info("console: ip=%s cmd=%r result=%r", request.remote_addr, cmd, (result or '')[:300])
+    return {'ok': not result.startswith('Error'), 'output': result or '(no output)'}, 200
+
+@app.route('/console')
+@requires_auth
+def console_page():
+    html = CONSOLE_TEMPLATE.replace('__FAVICON__', FAVICON)
+    html = html.replace('__CSRF__', get_csrf_token())
+    html = html.replace('__VERSION__', VERSION)
+    return html
+
+CONSOLE_TEMPLATE = """
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MC Console</title>
+    <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
+    <style>
+        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; }
+        :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
+        h1 { color: var(--accent); margin-bottom: 5px; font-size: 1.6em; }
+        .subtitle { color: var(--text2); margin-bottom: 16px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+        .header-btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .btn { color: var(--accent); text-decoration: none; font-size: 0.95em; padding: 8px 16px; border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; background: transparent; }
+        .btn:hover { background: var(--accent); color: var(--bg); }
+        .theme-toggle { background: var(--bg2); border: 1px solid var(--border2); color: var(--text); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 1.1em; }
+
+        .console-box { background: var(--bg2); border: 1px solid var(--border3); border-radius: 10px; padding: 12px; height: 60vh; overflow-y: auto; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.85em; line-height: 1.5; }
+        .console-line { padding: 2px 4px; white-space: pre-wrap; word-break: break-word; }
+        .console-line.cmd { color: var(--accent); font-weight: 600; }
+        .console-line.out { color: var(--text); }
+        .console-line.err { color: var(--red); }
+        .console-line.meta { color: var(--text3); font-style: italic; }
+        .console-form { display: flex; gap: 6px; margin-top: 12px; }
+        .console-form .prompt { color: var(--accent); font-family: monospace; font-size: 1.2em; padding: 10px 4px; }
+        .console-form input { flex: 1; background: var(--bg2); color: var(--text); border: 1px solid var(--border2); padding: 10px 14px; border-radius: 8px; font-size: 0.95em; font-family: ui-monospace, Menlo, Consolas, monospace; }
+        .console-form button { background: var(--accent); color: var(--bg); border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: 700; }
+        .console-help { font-size: 0.78em; color: var(--text3); margin-top: 6px; }
+        .console-help code { color: var(--blue); }
+    </style>
+    <script>
+        var CSRF_TOKEN = '__CSRF__';
+        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+    </script>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>&#x1F5A5; RCON Console</h1>
+            <div class="subtitle">Commands run as the server console. Every command is logged.</div>
+        </div>
+        <div class="header-btns">
+            <a href="/" class="btn">&#x2190; Dashboard</a>
+            <a href="/players" class="btn">&#x1F465; Players</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/logs" class="btn">&#x1F4DC; Logs</a>
+            <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
+        </div>
+    </div>
+
+    <div class="console-box" id="consoleBox">
+        <div class="console-line meta">Type a command below (leading / optional). Examples: list, tps, time set day, weather clear, give Petar4o diamond 3</div>
+    </div>
+    <form class="console-form" id="consoleForm">
+        <span class="prompt">&gt;</span>
+        <input type="text" id="consoleInput" placeholder="Command..." maxlength="200" autocomplete="off" autofocus>
+        <button type="submit">Run</button>
+    </form>
+    <div class="console-help">
+        &#x2191;/&#x2193; browse command history &middot; destructive commands (<code>stop</code>, <code>ban</code>, <code>op</code>, <code>whitelist off</code>...) ask for confirmation &middot; v__VERSION__
+    </div>
+
+    <script>
+        var cmdHistory = [];
+        var histIdx = -1;
+        var DANGEROUS = /^(stop|ban|ban-ip|op|deop|kill|whitelist\\s+off)\\b/i;
+
+        function addLine(text, cls) {
+            var box = document.getElementById('consoleBox');
+            var div = document.createElement('div');
+            div.className = 'console-line ' + cls;
+            div.textContent = text;
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        document.getElementById('consoleForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var input = document.getElementById('consoleInput');
+            var cmd = (input.value || '').trim();
+            if (!cmd) return;
+            if (DANGEROUS.test(cmd.replace(/^\\//, ''))) {
+                if (!confirm('Run potentially destructive command:\\n\\n' + cmd + '\\n\\nAre you sure?')) return;
+            }
+            cmdHistory.push(cmd);
+            histIdx = cmdHistory.length;
+            input.value = '';
+            addLine('> ' + cmd, 'cmd');
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fd.append('cmd', cmd);
+            fetch('/api/console', {
+                method: 'POST', body: fd,
+                headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+            }).then(function(r){ return r.json(); })
+              .then(function(d) {
+                  addLine(d.output || '(no output)', d.ok ? 'out' : 'err');
+              }).catch(function(err) {
+                  addLine('Network error: ' + err, 'err');
+              });
+        });
+
+        document.getElementById('consoleInput').addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (histIdx > 0) { histIdx--; this.value = cmdHistory[histIdx]; }
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (histIdx < history.length - 1) { histIdx++; this.value = cmdHistory[histIdx]; }
+                else { histIdx = cmdHistory.length; this.value = ''; }
+            }
+        });
+
+        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+    </script>
+</body>
+</html>
+"""
+
+# ----------------------------------------------------------------------------
+# Bans page
+# ----------------------------------------------------------------------------
+@app.route('/bans')
+@requires_auth
+def bans_page():
+    html = BANS_TEMPLATE.replace('__FAVICON__', FAVICON)
+    html = html.replace('__CSRF__', get_csrf_token())
+    html = html.replace('__VERSION__', VERSION)
+    html = html.replace('__AUTO_BAN_THRESHOLD__', str(AUTO_BAN_THRESHOLD))
+    html = html.replace('__AUTO_BAN_STATE__', 'enabled' if AUTO_BAN_ENABLED else 'disabled')
+    return html
+
+BANS_TEMPLATE = """
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MC Bans</title>
+    <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
+    <style>
+        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; --msg-bg: #1b3a4b; }
+        :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --tag-join-bg: #d5f5e3; --tag-reject-bg: #fadbd8; --tag-gdiscon-bg: #fcf3cf; --msg-bg: #d6eaf8; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
+        h1 { color: var(--accent); margin-bottom: 5px; font-size: 1.6em; }
+        .subtitle { color: var(--text2); margin-bottom: 16px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+        .header-btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .btn { color: var(--accent); text-decoration: none; font-size: 0.95em; padding: 8px 16px; border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; background: transparent; }
+        .btn:hover { background: var(--accent); color: var(--bg); }
+        .theme-toggle { background: var(--bg2); border: 1px solid var(--border2); color: var(--text); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 1.1em; }
+
+        .ban-info { background: var(--bg2); border: 1px solid var(--border3); border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; font-size: 0.88em; color: var(--text2); }
+        .ban-info code { color: var(--blue); }
+        .ban-form { display: flex; gap: 8px; flex-wrap: wrap; background: var(--bg2); border: 1px solid var(--border3); border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; align-items: center; }
+        .ban-form input { background: var(--bg); color: var(--text); border: 1px solid var(--border2); padding: 8px 12px; border-radius: 6px; font-size: 0.9em; }
+        .ban-form input#banIp { width: 160px; }
+        .ban-form input#banReason { flex: 1; min-width: 160px; }
+        .ban-form button { background: var(--red); color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+
+        table { width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 12px; overflow: hidden; }
+        th, td { padding: 10px 12px; text-align: left; font-size: 0.9em; }
+        thead { background: var(--bg3); }
+        thead th { color: var(--accent); font-weight: 600; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.5px; }
+        tbody tr { border-top: 1px solid var(--border3); }
+        td code { color: var(--blue); font-size: 0.9em; }
+        .src-auto { color: var(--yellow); font-size: 0.8em; text-transform: uppercase; }
+        .src-manual { color: var(--blue); font-size: 0.8em; text-transform: uppercase; }
+        .method-ufw { color: var(--accent); font-family: monospace; font-size: 0.85em; }
+        .method-rcon { color: var(--yellow); font-family: monospace; font-size: 0.85em; }
+        .unban-btn { background: none; border: 1px solid var(--accent); color: var(--accent); cursor: pointer; font-size: 0.82em; padding: 3px 10px; border-radius: 4px; }
+        .unban-btn:hover { background: var(--accent); color: var(--bg); }
+        .empty { color: var(--text3); text-align: center; padding: 30px; font-style: italic; }
+        .flag { margin-right: 4px; }
+
+        #toastContainer { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 10px; z-index: 9999; max-width: 360px; pointer-events: none; }
+        .toast { pointer-events: auto; padding: 12px 16px; border-radius: 8px; font-size: 0.9em; color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.3); display: flex; align-items: flex-start; gap: 10px; }
+        .toast.toast-success { background: #2d8f6f; }
+        .toast.toast-error { background: #c0392b; }
+        .toast.toast-warning { background: #d4a017; color: #1a1a2e; }
+        .toast.toast-info { background: #2980b9; }
+        .toast .toast-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 1.2em; line-height: 1; opacity: 0.7; padding: 0; margin-left: auto; }
+        @media (max-width: 700px) { body { padding: 12px; } th:nth-child(6), td:nth-child(6) { display: none; } }
+    </style>
+    <script>
+        var CSRF_TOKEN = '__CSRF__';
+        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+    </script>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>&#x1F6AB; Banned IPs</h1>
+            <div class="subtitle">Firewall-level bans (ufw) with RCON ban-ip fallback</div>
+        </div>
+        <div class="header-btns">
+            <a href="/" class="btn">&#x2190; Dashboard</a>
+            <a href="/players" class="btn">&#x1F465; Players</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
+            <a href="/logs" class="btn">&#x1F4DC; Logs</a>
+            <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
+        </div>
+    </div>
+
+    <div class="ban-info">
+        Auto-ban is <strong>__AUTO_BAN_STATE__</strong>: IPs reaching <strong>__AUTO_BAN_THRESHOLD__</strong> rejected connection
+        attempts are banned automatically (never IPs that had a successful join, never private ranges).
+        Preferred method is <code>ufw</code> (needs a sudoers entry, see README); falls back to RCON <code>ban-ip</code>
+        which only blocks the game port.
+    </div>
+
+    <div class="ban-form">
+        <label style="color:var(--text2);font-size:0.85em;">Ban an IP:</label>
+        <input type="text" id="banIp" placeholder="1.2.3.4" maxlength="15" autocomplete="off">
+        <input type="text" id="banReason" placeholder="Reason (optional)..." maxlength="100" autocomplete="off">
+        <button id="banBtn">&#x1F528; Ban</button>
+    </div>
+
+    <table>
+        <thead>
+            <tr><th>IP</th><th>Country</th><th>Reason</th><th>Source</th><th>Banned at</th><th>Method</th><th></th></tr>
+        </thead>
+        <tbody id="bansBody"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
+    </table>
+
+    <div id="toastContainer"></div>
+
+    <script>
+        function showToast(msg, type) {
+            type = type || 'info';
+            var c = document.getElementById('toastContainer');
+            var t = document.createElement('div');
+            t.className = 'toast toast-' + type;
+            t.innerHTML = '<span></span><button class="toast-close" type="button">&#x2715;</button>';
+            t.firstChild.textContent = msg;
+            t.querySelector('.toast-close').addEventListener('click', function(){ t.remove(); });
+            c.appendChild(t);
+            setTimeout(function(){ if (t.parentNode) t.remove(); }, 8000);
+        }
+
+        function flagEmoji(cc) {
+            if (!cc || cc.length !== 2) return '';
+            var A = 0x1F1E6;
+            var up = cc.toUpperCase();
+            return String.fromCodePoint(A + up.charCodeAt(0) - 65, A + up.charCodeAt(1) - 65);
+        }
+
+        function loadBans() {
+            fetch('/api/bans', { headers: { 'X-Requested-With': 'fetch' } })
+                .then(function(r){ return r.json(); })
+                .then(function(arr) {
+                    var body = document.getElementById('bansBody');
+                    body.innerHTML = '';
+                    if (!arr.length) {
+                        body.innerHTML = '<tr><td colspan="7" class="empty">No banned IPs</td></tr>';
+                        return;
+                    }
+                    arr.forEach(function(b) {
+                        var tr = document.createElement('tr');
+                        function td(html, isText) {
+                            var c = document.createElement('td');
+                            if (isText) c.textContent = html; else c.innerHTML = html;
+                            tr.appendChild(c);
+                            return c;
+                        }
+                        td('<code></code>').firstChild.textContent = b.ip || '';
+                        var country = (b.country || '?');
+                        var flag = flagEmoji(b.country_code || '');
+                        td((flag ? '<span class="flag">' + flag + '</span>' : '') +
+                           '<span></span>').lastChild.textContent = country;
+                        td(b.reason || '', true);
+                        td('<span class="src-' + (b.source === 'auto' ? 'auto' : 'manual') + '">' + (b.source || '?') + '</span>');
+                        td((b.banned_at || '').replace('T', ' '), true);
+                        td('<span class="method-' + (b.method === 'ufw' ? 'ufw' : 'rcon') + '">' + (b.method || '?') + '</span>');
+                        var actTd = document.createElement('td');
+                        var btn = document.createElement('button');
+                        btn.className = 'unban-btn';
+                        btn.textContent = 'Unban';
+                        btn.onclick = function() { unban(b.ip); };
+                        actTd.appendChild(btn);
+                        tr.appendChild(actTd);
+                        body.appendChild(tr);
+                    });
+                })
+                .catch(function(err) {
+                    document.getElementById('bansBody').innerHTML =
+                        '<tr><td colspan="7" class="empty">Error loading bans</td></tr>';
+                });
+        }
+
+        function unban(ip) {
+            if (!confirm('Unban ' + ip + '?')) return;
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fd.append('ip', ip);
+            fetch('/api/bans/remove', {
+                method: 'POST', body: fd,
+                headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+            }).then(function(r){ return r.json(); })
+              .then(function(d) { showToast(d.message || 'Done', d.toast || 'info'); loadBans(); })
+              .catch(function(err){ showToast('Network: ' + err, 'error'); });
+        }
+
+        document.getElementById('banBtn').addEventListener('click', function() {
+            var ip = (document.getElementById('banIp').value || '').trim();
+            var reason = (document.getElementById('banReason').value || '').trim();
+            if (!/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/.test(ip)) { showToast('Enter a valid IPv4 address', 'error'); return; }
+            if (!confirm('Ban ' + ip + '?')) return;
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fd.append('ip', ip);
+            fd.append('reason', reason);
+            fetch('/api/bans/add', {
+                method: 'POST', body: fd,
+                headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+            }).then(function(r){ return r.json(); })
+              .then(function(d) {
+                  showToast(d.message || 'Done', d.toast || 'info');
+                  document.getElementById('banIp').value = '';
+                  document.getElementById('banReason').value = '';
+                  loadBans();
+              })
+              .catch(function(err){ showToast('Network: ' + err, 'error'); });
+        });
+
+        loadBans();
+        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+    </script>
+</body>
+</html>
+"""
+
+# ----------------------------------------------------------------------------
 # Chat page
 # ----------------------------------------------------------------------------
 @app.route('/chat')
@@ -4060,6 +5037,8 @@ CHAT_TEMPLATE = """
             <a href="/plugins" class="btn">&#x1F9E9; Plugins</a>
             <a href="/backups" class="btn">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
     </div>
@@ -4411,6 +5390,7 @@ def players_page():
             actions_html = f"""<div class="player-actions">
                 <button class="player-action-btn" data-name="{name_attr}" onclick="openTeleport(this.dataset.name)" title="Teleport this player">&#x1F4CD; Teleport</button>
                 <button class="player-action-btn" data-name="{name_attr}" onclick="openNick(this.dataset.name)" title="Set or clear nickname">&#x270F;&#xFE0F; Nick</button>
+                <button class="player-action-btn" data-name="{name_attr}" onclick="openActions(this.dataset.name)" title="Kick, ban, gamemode, OP">&#x26A1; Actions</button>
             </div>"""
 
         return f"""<div class="{card_class}">
@@ -4623,6 +5603,10 @@ HTML_TEMPLATE = """
         .wl-remove { background: none; border: none; color: var(--red); cursor: pointer; font-size: 1.1em; padding: 2px 6px; border-radius: 4px; }
         .wl-remove:hover { background: var(--tag-reject-bg); }
         .wl-list { max-height: 220px; overflow-y: auto; }
+        .wl-state { font-size: 0.62em; padding: 2px 9px; border-radius: 10px; vertical-align: middle; letter-spacing: 0.5px; }
+        .wl-state.on { background: var(--tag-join-bg); color: var(--accent); }
+        .wl-state.off { background: var(--tag-reject-bg); color: var(--red); animation: pulse 1.5s infinite; }
+        .wl-state.unknown { background: var(--tag-leave-bg); color: var(--text3); }
         .platform-hint { font-size: 0.75em; padding: 3px 8px; border-radius: 4px; margin-top: 4px; display: inline-block; }
         .platform-hint.java { background: var(--tag-join-bg); color: var(--accent); }
         .platform-hint.bedrock { background: var(--tag-geyser-bg); color: var(--blue); }
@@ -4774,6 +5758,8 @@ HTML_TEMPLATE = """
             <a href="/backups" class="btn" title="Backups">&#x1F4BE; Backups</a>
             <a href="/logs" class="btn">&#x1F4DC; Logs</a>
             <a href="/chat" class="btn">&#x1F4AC; Chat</a>
+            <a href="/bans" class="btn">&#x1F6AB; Bans</a>
+            <a href="/console" class="btn">&#x1F5A5; Console</a>
             <a href="__CURRENT_URL__" class="btn">Refresh</a>
             <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">&#x2600;</span></button>
         </div>
@@ -4818,7 +5804,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="panel">
             <div style="display:flex;justify-content:space-between;align-items:center;">
-                <h2>Whitelist (__WL_COUNT__)</h2>
+                <h2>Whitelist (__WL_COUNT__) <span id="wlStateBadge" class="wl-state __WL_STATE_CLASS__">__WL_STATE__</span></h2>
                 <div style="display:flex;gap:6px;">
                     <button class="btn" onclick="wlToggle('on')" style="padding:4px 10px;font-size:0.8em;">ON</button>
                     <button class="btn btn-danger" onclick="wlToggle('off')" style="padding:4px 10px;font-size:0.8em;">OFF</button>
@@ -5070,6 +6056,14 @@ HTML_TEMPLATE = """
                     setText('sbBackup', s.backup_count + ' (' + s.backup_last_size + ', ' + s.backup_last_date + ')');
                     setText('sbUpdated', s.now);
 
+                    // Whitelist ON/OFF badge
+                    var wlB = document.getElementById('wlStateBadge');
+                    if (wlB) {
+                        var on = s.whitelist_on;
+                        wlB.textContent = on === true ? 'ON' : (on === false ? 'OFF' : '?');
+                        wlB.className = 'wl-state ' + (on === true ? 'on' : (on === false ? 'off' : 'unknown'));
+                    }
+
                     // Online players list
                     var ol = document.getElementById('liveOnlineList');
                     if (ol) {
@@ -5287,6 +6281,15 @@ def index():
     html = html.replace('__ONLINE_PLAYERS_LIST__', online_list)
     html = html.replace('__WHITELIST__', build_whitelist_panel(wl_players, nicknames))
     html = html.replace('__WL_COUNT__', str(len(wl_players)))
+    wl_enabled = get_whitelist_enabled()
+    if wl_enabled is True:
+        wl_state, wl_state_class = 'ON', 'on'
+    elif wl_enabled is False:
+        wl_state, wl_state_class = 'OFF', 'off'
+    else:
+        wl_state, wl_state_class = '?', 'unknown'
+    html = html.replace('__WL_STATE_CLASS__', wl_state_class)
+    html = html.replace('__WL_STATE__', wl_state)
 
     html = html.replace('__VPS_UPTIME__', sys_status['vps_uptime'])
     html = html.replace('__MC_UPTIME__', sys_status['mc_uptime'])

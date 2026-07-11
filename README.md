@@ -19,6 +19,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 - Per-player stats: joins, leaves, total play time, sessions, average and longest session, first/last seen, IPs
 - **Teleport modal** — to another player or X/Y/Z coordinates, with `~` relative support and saved location bookmarks
 - **Nick modal** — set or clear EssentialsX nicknames (`/nick name [value|off]`)
+- **Quick actions modal** — kick (with reason), ban/pardon, gamemode (survival/creative/adventure/spectator), OP/de-op
 - **Auto-Bedrock onboarding** — temporarily disables whitelist, watches docker logs, auto-adds Bedrock player when they connect, then re-enables whitelist. A server-side watchdog re-enables the whitelist when the window expires even if no browser is open
 - Auto-detection of Java vs Bedrock via Mojang API (cached 1 hour)
 
@@ -37,6 +38,20 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 - Aggregate stats (count, total size, average, world size, newest, oldest)
 - Status banner colored by age (ok / `>30h` warn / `>48h` bad / no backups)
 - Full archive table with size, **delta vs previous backup**, creation date, age
+- **Backup now** button — pauses world saving (`save-off` + `save-all flush`), tars the world dirs in a background thread with live progress, then `save-on`
+- **Delete** button per archive (filename validated, confined to the backup dir)
+
+**Bans** on `/bans`
+
+- **Auto-ban**: the watchdog thread bans IPs that reach `AUTO_BAN_THRESHOLD` (default 20) rejected connection attempts. IPs with any successful JOIN and private ranges are never auto-banned
+- Ban method: `sudo -n ufw insert 1 deny from <ip>` (firewall-level, needs a sudoers entry — see installation) with automatic fallback to RCON `ban-ip` (game-level only)
+- Ban list with **country** (ip-api.com lookup at ban time, flag emoji), reason, source (auto/manual), date and method
+- Manual ban / unban from the page; unban uses the same method the ban was made with
+
+**RCON console** on `/console`
+
+- Free-form server command with output, arrow-key history, confirmation prompt for destructive commands (`stop`, `ban`, `op`, `whitelist off`...)
+- Every command is logged with the client IP. Adds no new attack surface — dashboard credentials already carry RCON-equivalent power via the other endpoints
 
 **Chat** on `/chat`
 
@@ -58,11 +73,13 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 **Charts** on `/charts`
 
 - Six overlaid system metrics with selectable time ranges (1d to 180d)
+- **Storage trend chart** — disk %, world size GB, total backup size GB over time
 - **Per-player playtime bar chart** with player selector and 14/30/60/90-day range
 - Automatic downsampling to 500 data points
 
 **General**
 
+- Whitelist ON/OFF live indicator on the dashboard (reads `server.properties`)
 - Dark/light theme toggle with cookie persistence
 - Mobile-responsive
 - HTTP Basic Auth
@@ -151,6 +168,17 @@ sudo ufw allow 8090/tcp comment 'MC Dashboard'
 
 For public exposure, prefer fronting with Nginx + Let's Encrypt rather than exposing port 8090 directly.
 
+### 6a. (Optional) Allow firewall-level bans
+
+The `/bans` page and the auto-ban feature prefer blocking IPs with `ufw`, which requires the dashboard's user to run `ufw` via sudo without a password. Add a sudoers entry:
+
+```bash
+echo 'your_username ALL=(root) NOPASSWD: /usr/sbin/ufw' | sudo tee /etc/sudoers.d/mc-dashboard-ufw
+sudo chmod 440 /etc/sudoers.d/mc-dashboard-ufw
+```
+
+Without this, bans still work but fall back to RCON `ban-ip`, which only blocks the game — port scanners will still hit the port.
+
 ### 7. Set up the metrics + chat + logs collector
 
 ```bash
@@ -192,6 +220,8 @@ Flask web application. Seven pages:
 | `/backups` | Backup file list with deltas, status, world size |
 | `/chat` | Persistent chat history with search/filter, send form |
 | `/logs` | Docker logs tail with level filter, search, live mode |
+| `/bans` | Banned IPs with country/date/method, manual ban/unban |
+| `/console` | RCON console with history and confirmations |
 
 Live data is fetched via JSON endpoints behind a 5-second poller, so navigating between pages or watching one open doesn't trigger full HTML re-renders.
 
@@ -210,6 +240,8 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | GET | `/backups` | Backups page |
 | GET | `/chat` | Chat page |
 | GET | `/logs` | Logs page |
+| GET | `/bans` | Bans page |
+| GET | `/console` | Console page |
 
 ### Read APIs
 
@@ -224,6 +256,8 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | GET | `/api/logs?tail=N&level=X&search=Y` | Docker log lines (max 2000) |
 | GET | `/api/locations` | Saved teleport bookmarks |
 | GET | `/api/plugins/history` | Last 50 plugin update events |
+| GET | `/api/bans` | Banned IPs (newest first) |
+| GET | `/api/backups/status` | Running/last backup job state |
 
 ### Write APIs (require CSRF)
 
@@ -242,6 +276,12 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | POST | `/api/locations/remove` | `name` |
 | POST | `/api/plugins/update` | `file`, `url` (downloads, SHA-256 dedupes) |
 | POST | `/api/plugins/update-all` | Iterates all saved URLs |
+| POST | `/api/backups/create` | Start a backup job (background thread) |
+| POST | `/api/backups/delete` | `filename` (must match `world-*.tar.gz`) |
+| POST | `/api/bans/add` | `ip`, optional `reason` |
+| POST | `/api/bans/remove` | `ip` (unban via the original method) |
+| POST | `/api/player/action` | `name`, `action=kick\|ban\|pardon\|gamemode\|op\|deop`, optional `arg` |
+| POST | `/api/console` | `cmd` (free-form RCON command, logged) |
 
 When called with `X-Requested-With: fetch` (or `Accept: application/json`), POST endpoints respond with JSON `{ok, message, toast}` instead of redirecting. The browser UI uses fetch throughout.
 
@@ -270,6 +310,7 @@ Runtime files (created automatically, excluded from git):
 | `~/mc-plugin-urls.json` | Plugin filename -> download URL map |
 | `~/mc-plugin-history.json` | Last 50 plugin update events |
 | `~/mc-web-auth.json` | Dashboard credentials (auto-created, mode 0600) |
+| `~/mc-banned-ips.json` | Banned IPs with country/date/method |
 | `~/.mc-web-secret` | Flask session secret (32 random bytes, mode 0600) |
 | `~/.mc-logger-state` | Logger position tracker |
 | `~/mc-access-web.log` | App log |
@@ -294,6 +335,8 @@ Runtime files (created automatically, excluded from git):
 | `SECRET_KEY_FILE` | `/home/pi/.mc-web-secret` | Flask session secret |
 | `PER_PAGE` | `50` | Events per page in dashboard log table |
 | `SUSPICIOUS_THRESHOLD` | `10` | Rejected attempts before IP alert |
+| `AUTO_BAN_ENABLED` | `True` | Watchdog auto-bans aggressive IPs |
+| `AUTO_BAN_THRESHOLD` | `20` | Rejected attempts before auto-ban |
 | `ONBOARDING_DEFAULT_MINUTES` | `5` | Default Bedrock onboarding window |
 
 ### `mc-access-logger.py`

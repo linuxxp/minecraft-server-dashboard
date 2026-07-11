@@ -13,6 +13,7 @@ __pycache__/
 
 # Runtime files (do NOT commit — these contain user data and secrets)
 mc-web-auth.json
+mc-banned-ips.json
 mc-access-log.json
 mc-metrics.json
 mc-chat-log.json

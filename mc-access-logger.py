@@ -4,8 +4,12 @@ Minecraft Server Access Logger + Metrics Collector
 Monitors Docker logs for connection attempts and collects system metrics.
 Run via cron every 5 minutes: */5 * * * * /usr/bin/python3 /home/pi/mc-access-logger.py
 
-Version: 2.0.0
+Version: 2.1.0
 Changelog:
+  v2.1.0 (2026-07-11)
+    - Metrics now also record disk usage % ("disk"), world size in GB
+      ("world_gb") and total backup archive size in GB ("backups_gb") so the
+      dashboard can chart storage trends over time.
   v2.0.0 (2026-07-11)
     - FIX: log position is reset to 0 when it points beyond the current log
       length (container recreated -> docker logs starts over). Previously all
@@ -37,10 +41,13 @@ import subprocess
 import re
 import os
 import json
+import glob
 import logging
 import psutil
 from datetime import datetime, timedelta
 
+WORLD_DIR = "/opt/minecraft/data"
+BACKUP_DIR = "/opt/minecraft/backups"
 LOG_FILE = "/home/pi/mc-access-log.json"
 METRICS_FILE = "/home/pi/mc-metrics.json"
 CHAT_FILE = "/home/pi/mc-chat-log.json"
@@ -305,6 +312,44 @@ def collect_metrics():
 
     # Swap percent
     metrics["swap"] = psutil.swap_memory().percent
+
+    # Disk percent (root filesystem)
+    try:
+        metrics["disk"] = psutil.disk_usage('/').percent
+    except Exception:
+        log.exception("disk usage failed")
+        metrics["disk"] = 0
+
+    # World size (GB) — os.walk over the world dirs; runs every 5 min which is
+    # acceptable even for multi-GB worlds (it only stats, doesn't read files)
+    try:
+        world_bytes = 0
+        for w in ('world', 'world_nether', 'world_the_end'):
+            wp = os.path.join(WORLD_DIR, w)
+            if os.path.isdir(wp):
+                for dirpath, _dirnames, filenames in os.walk(wp):
+                    for fn in filenames:
+                        try:
+                            world_bytes += os.path.getsize(os.path.join(dirpath, fn))
+                        except OSError:
+                            pass
+        metrics["world_gb"] = round(world_bytes / 1024**3, 2)
+    except Exception:
+        log.exception("world size failed")
+        metrics["world_gb"] = 0
+
+    # Total backup archive size (GB)
+    try:
+        backup_bytes = 0
+        for path in glob.glob(os.path.join(BACKUP_DIR, 'world-*.tar.gz')):
+            try:
+                backup_bytes += os.path.getsize(path)
+            except OSError:
+                pass
+        metrics["backups_gb"] = round(backup_bytes / 1024**3, 2)
+    except Exception:
+        log.exception("backup size failed")
+        metrics["backups_gb"] = 0
 
     # MC heap and TPS and players from RCON
     mem_output = rcon('memory')
