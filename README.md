@@ -10,7 +10,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 
 - Online players with skin head icons, TPS, server uptime, MC heap usage
 - CPU, RAM, swap, disk, world size, last backup info
-- Suspicious-IP alerts when an IP gets 5+ rejected connection attempts
+- Suspicious-IP alerts when an IP gets 10+ rejected connection attempts (configurable)
 - Historical metrics (CPU, RAM, MC heap, swap, TPS, online count) collected every 5 minutes, retained 180 days
 
 **Player management** on a dedicated `/players` page
@@ -19,7 +19,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 - Per-player stats: joins, leaves, total play time, sessions, average and longest session, first/last seen, IPs
 - **Teleport modal** — to another player or X/Y/Z coordinates, with `~` relative support and saved location bookmarks
 - **Nick modal** — set or clear EssentialsX nicknames (`/nick name [value|off]`)
-- **Auto-Bedrock onboarding** — temporarily disables whitelist, watches docker logs, auto-adds Bedrock player when they connect, then re-enables whitelist
+- **Auto-Bedrock onboarding** — temporarily disables whitelist, watches docker logs, auto-adds Bedrock player when they connect, then re-enables whitelist. A server-side watchdog re-enables the whitelist when the window expires even if no browser is open
 - Auto-detection of Java vs Bedrock via Mojang API (cached 1 hour)
 
 **Plugin management** on `/plugins`
@@ -110,12 +110,16 @@ cd minecraft-server-dashboard
 
 ### 3. Configure credentials
 
-Edit `mc-access-web.py` and change the username and password near the top:
+Credentials are **not** stored in the code. On first start the app creates an auth file (default `/home/pi/mc-web-auth.json`, mode 0600) with username `admin` and a random password:
 
-```python
-USERNAME = "your_username"
-PASSWORD = "your_password"
+```json
+{
+  "username": "admin",
+  "password": "generated-random-password"
+}
 ```
+
+Open the file to see the generated password, edit it to set your own credentials, then restart the service. Alternatively, set the `MC_WEB_USERNAME` and `MC_WEB_PASSWORD` environment variables (e.g. in the systemd unit) — they take precedence over the file. The auth file location itself can be changed with `MC_WEB_AUTH_FILE`.
 
 These are checked via HTTP Basic Auth. The dashboard does not have a login page — your browser shows the standard credentials prompt.
 
@@ -265,6 +269,7 @@ Runtime files (created automatically, excluded from git):
 | `~/mc-locations.json` | Saved teleport bookmarks |
 | `~/mc-plugin-urls.json` | Plugin filename -> download URL map |
 | `~/mc-plugin-history.json` | Last 50 plugin update events |
+| `~/mc-web-auth.json` | Dashboard credentials (auto-created, mode 0600) |
 | `~/.mc-web-secret` | Flask session secret (32 random bytes, mode 0600) |
 | `~/.mc-logger-state` | Logger position tracker |
 | `~/mc-access-web.log` | App log |
@@ -276,8 +281,7 @@ Runtime files (created automatically, excluded from git):
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `USERNAME` | `admin` | Dashboard username |
-| `PASSWORD` | `changeme` | Dashboard password |
+| `AUTH_FILE` | `/home/pi/mc-web-auth.json` | Credentials file (auto-created on first start); override path with `MC_WEB_AUTH_FILE`, or bypass entirely with `MC_WEB_USERNAME`/`MC_WEB_PASSWORD` env vars |
 | `WORLD_DIR` | `/opt/minecraft/data` | Server data dir (`plugins/`, `whitelist.json`) |
 | `BACKUP_DIR` | `/opt/minecraft/backups` | Where `world-*.tar.gz` archives live |
 | `LOG_FILE` | `/home/pi/mc-access-log.json` | Access log read by web app |
@@ -289,7 +293,7 @@ Runtime files (created automatically, excluded from git):
 | `ONBOARDING_FILE` | `/home/pi/mc-onboarding-state.json` | Onboarding state |
 | `SECRET_KEY_FILE` | `/home/pi/.mc-web-secret` | Flask session secret |
 | `PER_PAGE` | `50` | Events per page in dashboard log table |
-| `SUSPICIOUS_THRESHOLD` | `5` | Rejected attempts before IP alert |
+| `SUSPICIOUS_THRESHOLD` | `10` | Rejected attempts before IP alert |
 | `ONBOARDING_DEFAULT_MINUTES` | `5` | Default Bedrock onboarding window |
 
 ### `mc-access-logger.py`
@@ -306,12 +310,13 @@ Runtime files (created automatically, excluded from git):
 
 This is a low-stakes admin dashboard for a private server, but it does have RCON-equivalent power so we take a few common-sense precautions:
 
-- **HTTP Basic Auth** on every endpoint, including JSON APIs.
+- **HTTP Basic Auth** on every endpoint, including JSON APIs. Credentials live in a separate auth file (mode 0600) or environment variables — never in the source. Comparison is constant-time (`hmac.compare_digest`).
 - **CSRF token** required for every POST. Token is per-session, served via meta tag and form field.
 - **Stable Flask session secret** stored in `~/.mc-web-secret` (32 random bytes, mode 0600), persisting across restarts so cookies don't get invalidated.
 - **HTML-escape** on all rendered user content (player names, nicknames, chat text, plugin filenames, etc.) via `markupsafe.escape`.
 - **Strict regex validation** on inputs that flow into RCON commands:
-  - Player names: `^[A-Za-z0-9_]{1,32}$`
+  - Player names: `^[A-Za-z0-9_]{1,32}$` (whitelist/onboarding accept Bedrock gamertags: spaces and dashes allowed)
+  - Whitelist toggle state: only `on` / `off`
   - Coordinates: each token `^~?-?\d+(?:\.\d+)?$|^~$`
   - Nicknames: `^[A-Za-z0-9_\- ]{1,24}$`
   - Chat text: no control characters, max 200 chars

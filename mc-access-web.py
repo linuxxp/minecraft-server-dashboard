@@ -3,8 +3,33 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 1.16.1
+Version: 2.0.0
 Changelog:
+  v2.0.0 (2026-07-11)
+    - SECURITY: credentials moved out of the source code into an auth file
+      (default /home/pi/mc-web-auth.json, override with MC_WEB_AUTH_FILE).
+      Auto-created with a random password on first start - open the file to
+      see it, edit it to set your own credentials, then restart the service.
+      MC_WEB_USERNAME / MC_WEB_PASSWORD env vars take precedence over the file.
+      NOTE: the previously hardcoded password was committed to a public repo
+      and must be considered leaked - pick a fresh one.
+    - SECURITY: fixed reflected XSS via the dashboard filter query params
+      (?type= / ?player= / ?ip= were substituted into HTML attributes and
+      inline JS without escaping).
+    - SECURITY: constant-time credential comparison (hmac.compare_digest).
+    - FIX: onboarding watchdog. A background thread now ticks the onboarding
+      state machine every 30s, so the whitelist is re-enabled when the window
+      expires (or the player joins) even with no browser open. Previously the
+      state machine only ran on page loads - an abandoned onboarding left the
+      whitelist OFF indefinitely.
+    - FIX: Mojang profile lookups for unknown names raise HTTPError (404) in
+      urllib, so detect_platform's 'bedrock' branch never ran and every
+      unknown name came back 'unknown'. 404/204 now correctly classify as
+      Bedrock.
+    - FIX: whitelist add/remove/onboard player names and the whitelist toggle
+      state are now validated before being interpolated into RCON commands.
+    - FIX: non-numeric ?page= / ?days= query params no longer crash with
+      HTTP 500 (int parsing is clamped with safe fallbacks).
   v1.16.1 (2026-05-07)
     - FIX: plugin <-> JAR matching was wrong for plugins whose names share a
       prefix (ViaVersion + ViaVersionStatus, WorldEdit + WorldGuard, etc.).
@@ -222,6 +247,7 @@ import subprocess
 import psutil
 from datetime import datetime, timedelta, timezone
 from collections import Counter
+from urllib.parse import quote_plus
 
 def esc(value):
     """HTML-escape any value (None-safe). Returns plain str, not Markup."""
@@ -299,12 +325,56 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "1.16.1"
+VERSION = "2.0.0"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
 
-USERNAME = "linuxxp"
-PASSWORD = "mechopuhemeche"
+# ----------------------------------------------------------------------------
+# Credentials — never hardcoded in the source. Resolution order:
+#   1. MC_WEB_USERNAME + MC_WEB_PASSWORD environment variables
+#   2. Auth file (JSON: {"username": ..., "password": ...}), mode 0600
+#   3. First run: auth file is created with a random password — open the file
+#      to see it, edit it to set your own credentials, then restart.
+# ----------------------------------------------------------------------------
+AUTH_FILE = os.environ.get('MC_WEB_AUTH_FILE', '/home/pi/mc-web-auth.json')
+
+def _load_or_create_auth():
+    env_user = os.environ.get('MC_WEB_USERNAME', '')
+    env_pass = os.environ.get('MC_WEB_PASSWORD', '')
+    if env_user and env_pass:
+        log.info("credentials taken from MC_WEB_USERNAME/MC_WEB_PASSWORD env vars")
+        return env_user, env_pass
+
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            user = str(data.get('username', '')).strip()
+            pw = str(data.get('password', ''))
+            if user and pw:
+                return user, pw
+            log.error("auth file %s is missing username/password fields", AUTH_FILE)
+        except Exception:
+            log.exception("could not read auth file %s", AUTH_FILE)
+        # Existing but broken file: do NOT overwrite it. Serve with an
+        # unguessable throwaway password (locked out until the file is fixed).
+        log.error("auth file unusable - fix %s and restart. Logins are disabled "
+                  "with a random throwaway password until then.", AUTH_FILE)
+        return 'admin', secrets.token_urlsafe(32)
+
+    # First run: create the file with a random password.
+    user, pw = 'admin', secrets.token_urlsafe(12)
+    try:
+        with open(AUTH_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'username': user, 'password': pw}, f, indent=2)
+        os.chmod(AUTH_FILE, 0o600)
+        log.warning("created %s with a random password. Open the file to see it, "
+                    "edit it to set your own credentials, then restart.", AUTH_FILE)
+    except Exception:
+        log.exception("could not create auth file %s", AUTH_FILE)
+    return user, pw
+
+USERNAME, PASSWORD = _load_or_create_auth()
 
 PER_PAGE = 50
 SUSPICIOUS_THRESHOLD = 10
@@ -319,7 +389,10 @@ def strip_ansi(text):
     return text
 
 def check_auth(username, password):
-    return username == USERNAME and password == PASSWORD
+    # Constant-time comparison; & (not `and`) so both checks always run.
+    user_ok = hmac.compare_digest((username or '').encode(), USERNAME.encode())
+    pass_ok = hmac.compare_digest((password or '').encode(), PASSWORD.encode())
+    return user_ok & pass_ok
 
 def authenticate():
     return Response('Login required', 401, {'WWW-Authenticate': 'Basic realm="Minecraft Access Log"'})
@@ -495,19 +568,27 @@ def detect_platform(name):
         return ('bedrock', None)
 
     def _probe():
+        import urllib.request
+        import urllib.error
         try:
-            import urllib.request
             req = urllib.request.Request(
                 f'https://api.mojang.com/users/profiles/minecraft/{clean}',
-                headers={'User-Agent': 'mc-access-web/1.11'},
+                headers={'User-Agent': 'mc-access-web/2.0'},
             )
             with urllib.request.urlopen(req, timeout=4) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
                     return ('java', data.get('id', ''))
-                if resp.status == 204 or resp.status == 404:
+                if resp.status == 204:
                     return ('bedrock', None)
                 return ('unknown', None)
+        except urllib.error.HTTPError as e:
+            # urllib raises on 4xx/5xx, so "no such Java profile" (404, or the
+            # legacy 204-as-error case) lands here — that means Bedrock.
+            if e.code in (204, 404):
+                return ('bedrock', None)
+            log.debug("Mojang lookup HTTP %d for %r", e.code, clean)
+            return ('unknown', None)
         except Exception:
             log.debug("Mojang lookup failed for %r", clean, exc_info=True)
             return ('unknown', None)
@@ -951,6 +1032,38 @@ def process_onboarding():
         'last_outcome': outcome, 'reject_reason': reason,
     }
 
+# ----------------------------------------------------------------------------
+# Onboarding watchdog — the state machine above is also ticked on page loads,
+# but if the admin closes the browser mid-onboarding nothing would ever
+# re-enable the whitelist. This background thread guarantees the window closes
+# (and the player gets auto-whitelisted on join) regardless of open pages.
+# ----------------------------------------------------------------------------
+ONBOARDING_WATCHDOG_INTERVAL = 30  # seconds
+
+_watchdog_started = False
+
+def _start_onboarding_watchdog():
+    global _watchdog_started
+    if _watchdog_started:
+        return
+    _watchdog_started = True
+
+    def _tick_forever():
+        while True:
+            time.sleep(ONBOARDING_WATCHDOG_INTERVAL)
+            try:
+                if get_onboarding_state():
+                    process_onboarding()
+            except Exception:
+                log.exception("onboarding watchdog tick failed")
+
+    import threading
+    t = threading.Thread(target=_tick_forever, daemon=True, name='onboarding-watchdog')
+    t.start()
+    log.info("onboarding watchdog started (interval %ds)", ONBOARDING_WATCHDOG_INTERVAL)
+
+_start_onboarding_watchdog()
+
 def get_top_players(events, limit=10):
     joins = [e.get('player', '') for e in events if e.get('type') == 'JOIN' and e.get('player')]
     return Counter(joins).most_common(limit)
@@ -1102,6 +1215,19 @@ def _wants_json():
         or 'application/json' in (request.headers.get('Accept', ''))
     )
 
+def _int_arg(name, default, lo=None, hi=None):
+    """Read an int query param with a safe fallback and optional clamping.
+    Garbage input (?page=abc) falls back to the default instead of a 500."""
+    try:
+        val = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        val = default
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
 def _respond(message, redirect_to='/', toast='info'):
     """Either JSON (for fetch) or HTML redirect (for plain forms).
 
@@ -1111,7 +1237,6 @@ def _respond(message, redirect_to='/', toast='info'):
     is_ok = toast != 'error'
     if _wants_json():
         return {'ok': is_ok, 'message': message, 'toast': toast}, 200
-    from urllib.parse import quote_plus
     return redirect(f'{redirect_to}?msg={quote_plus(message)}')
 
 @app.route('/api/whitelist/add', methods=['POST'])
@@ -1123,6 +1248,8 @@ def api_whitelist_add():
     if not name:
         return _respond('Empty name', toast='error')
     clean_name = name.lstrip('.')
+    if not BEDROCK_NAME_RE.match(clean_name):
+        return _respond('Bad player name (letters/digits/underscore/space/dash, max 32)', toast='error')
 
     # Auto-detect platform if not explicitly given (or set to 'auto')
     if ptype not in ('java', 'bedrock'):
@@ -1154,6 +1281,8 @@ def api_whitelist_remove():
     name = request.form.get('name', '').strip()
     if not name:
         return _respond('Empty name', toast='error')
+    if not BEDROCK_NAME_RE.match(name.lstrip('.')):
+        return _respond('Bad player name', toast='error')
     if name.startswith('.'):
         result = rcon(f'fwhitelist remove {name[1:]}')
     else:
@@ -1166,7 +1295,9 @@ def api_whitelist_remove():
 @requires_auth
 @requires_csrf
 def api_whitelist_toggle():
-    state = request.form.get('state', 'on')
+    state = request.form.get('state', 'on').strip().lower()
+    if state not in ('on', 'off'):
+        return _respond('Bad state (on/off)', toast='error')
     result = rcon(f'whitelist {state}')
     log.info("whitelist toggle: state=%s result=%r", state, result)
     msg = 'Whitelist ON' if state == 'on' else 'Whitelist OFF - anyone can join!'
@@ -1190,6 +1321,8 @@ def api_whitelist_onboard():
 
     if not name:
         return _respond('Empty name', toast='error')
+    if not BEDROCK_NAME_RE.match(name):
+        return _respond('Bad player name (letters/digits/underscore/space/dash, max 32)', toast='error')
 
     # Auto-detect platform unless explicitly forced
     if platform not in ('java', 'bedrock'):
@@ -1247,6 +1380,10 @@ COORD_TOKEN_RE = re.compile(r'^~?-?\d+(?:\.\d+)?$|^~$')
 # Java player name (also matches the bare alphanumeric form of Bedrock names typed
 # without dot — RCON adds the dot back automatically when needed via Floodgate)
 PLAYER_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,32}$')
+# Bedrock gamertags may contain spaces and dashes (Xbox gamertag rules), so the
+# whitelist endpoints use this looser form. Still tight enough that nothing
+# command-injection-shaped reaches RCON.
+BEDROCK_NAME_RE = re.compile(r'^[A-Za-z0-9_\- ]{1,32}$')
 
 def _validate_coords(s):
     """Parse '100 64 -200' or '~ ~ ~10' into a normalized 3-token string, or None."""
@@ -1346,7 +1483,7 @@ def api_detect_platform():
 @app.route('/api/metrics')
 @requires_auth
 def api_metrics():
-    days = int(request.args.get('days', 1))
+    days = _int_arg('days', 1, lo=1, hi=365)
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     data = []
     if os.path.exists(METRICS_FILE):
@@ -1465,7 +1602,7 @@ def api_players():
 @requires_auth
 def api_playtime(player):
     """Return per-day playtime totals for a single player (last 30 days)."""
-    days = max(1, min(int(request.args.get('days', 30)), 180))
+    days = _int_arg('days', 30, lo=1, hi=180)
     events = load_events()
     sessions = merge_sessions_for_bedrock(compute_player_sessions(events))
     player_sessions = sessions.get(player, [])
@@ -4720,7 +4857,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="filters">
-        <select onchange="window.location.href='/?type='+this.value+'&player=__FILTER_PLAYER__&ip=__FILTER_IP__&page=1'">
+        <select onchange="window.location.href='/?type='+encodeURIComponent(this.value)+'&player=__FILTER_PLAYER_Q__&ip=__FILTER_IP_Q__&page=1'">
             <option value="">All Events</option>
             <option value="JOIN" __SEL_JOIN__>JOIN</option>
             <option value="LEAVE" __SEL_LEAVE__>LEAVE</option>
@@ -4729,9 +4866,9 @@ HTML_TEMPLATE = """
             <option value="GEYSER_DISCONNECT" __SEL_GEYSER_DISCONNECT__>GEYSER_DISCONNECT</option>
         </select>
         <input type="text" id="playerFilter" placeholder="Filter by player..." value="__FILTER_PLAYER__"
-               onkeyup="if(event.key==='Enter')window.location.href='/?type=__FILTER_TYPE__&player='+this.value+'&ip=__FILTER_IP__&page=1'">
+               onkeyup="if(event.key==='Enter')window.location.href='/?type=__FILTER_TYPE_Q__&player='+encodeURIComponent(this.value)+'&ip=__FILTER_IP_Q__&page=1'">
         <input type="text" id="ipFilter" placeholder="Filter by IP..." value="__FILTER_IP__"
-               onkeyup="if(event.key==='Enter')window.location.href='/?type=__FILTER_TYPE__&player=__FILTER_PLAYER__&ip='+this.value+'&page=1'">
+               onkeyup="if(event.key==='Enter')window.location.href='/?type=__FILTER_TYPE_Q__&player=__FILTER_PLAYER_Q__&ip='+encodeURIComponent(this.value)+'&page=1'">
     </div>
 
     <table>
@@ -5002,7 +5139,7 @@ def index():
     filter_player = request.args.get('player', '')
     filter_ip = request.args.get('ip', '')
     msg = request.args.get('msg', '')
-    page = max(1, int(request.args.get('page', 1)))
+    page = _int_arg('page', 1, lo=1)
 
     all_joins = [e for e in events if e.get('type') == 'JOIN']
     unique_players = len(set(e.get('player', '') for e in all_joins))
@@ -5054,7 +5191,12 @@ def index():
         </tr>""")
 
     empty_msg = '<div class="empty">No events found</div>' if not rows else ''
-    base_url = f"/?type={filter_type}&player={filter_player}&ip={filter_ip}"
+    # URL-encoded copies of the filters: used inside hrefs and inline JS URL
+    # building. Raw values would allow reflected XSS (attribute breakout).
+    ft_q = quote_plus(filter_type)
+    fp_q = quote_plus(filter_player)
+    fip_q = quote_plus(filter_ip)
+    base_url = f"/?type={ft_q}&player={fp_q}&ip={fip_q}"
     prev_btn = f'<a href="{base_url}&page={page-1}" class="btn">&laquo; Prev</a>' if page > 1 else '<span class="btn disabled">&laquo; Prev</span>'
     next_btn = f'<a href="{base_url}&page={page+1}" class="btn">Next &raquo;</a>' if page < total_pages else '<span class="btn disabled">Next &raquo;</span>'
     current_url = f"{base_url}&page={page}"
@@ -5122,9 +5264,11 @@ def index():
     html = html.replace('__UNIQUE_PLAYERS__', str(unique_players))
     html = html.replace('__TOTAL_REJECTED__', str(total_rejected))
     html = html.replace('__TOTAL_EVENTS__', str(len(events)))
-    html = html.replace('__FILTER_TYPE__', filter_type)
-    html = html.replace('__FILTER_PLAYER__', filter_player)
-    html = html.replace('__FILTER_IP__', filter_ip)
+    html = html.replace('__FILTER_TYPE_Q__', esc(ft_q))
+    html = html.replace('__FILTER_PLAYER_Q__', esc(fp_q))
+    html = html.replace('__FILTER_IP_Q__', esc(fip_q))
+    html = html.replace('__FILTER_PLAYER__', esc(filter_player))
+    html = html.replace('__FILTER_IP__', esc(filter_ip))
     html = html.replace('__SEL_JOIN__', 'selected' if filter_type == 'JOIN' else '')
     html = html.replace('__SEL_LEAVE__', 'selected' if filter_type == 'LEAVE' else '')
     html = html.replace('__SEL_REJECTED__', 'selected' if filter_type == 'REJECTED' else '')

@@ -4,8 +4,15 @@ Minecraft Server Access Logger + Metrics Collector
 Monitors Docker logs for connection attempts and collects system metrics.
 Run via cron every 5 minutes: */5 * * * * /usr/bin/python3 /home/pi/mc-access-logger.py
 
-Version: 1.4.0
+Version: 2.0.0
 Changelog:
+  v2.0.0 (2026-07-11)
+    - FIX: log position is reset to 0 when it points beyond the current log
+      length (container recreated -> docker logs starts over). Previously all
+      events were silently skipped until the new log outgrew the old position.
+    - Events are now batched into a single file write per run (previously the
+      whole 10000-entry JSON was rewritten once per event, which hurt on
+      bursts of rejected connections from scanners).
   v1.4.0 (2026-05-06)
     - Persistent chat history: <Player> messages and [Server] broadcasts are
       now captured to /home/pi/mc-chat-log.json (90-day retention, capped at
@@ -141,7 +148,10 @@ def get_docker_logs():
         log.exception("docker logs failed")
         return []
 
-def append_event(event):
+def append_events(new_events):
+    """Append a batch of events in a single read + write of the events file."""
+    if not new_events:
+        return
     events = []
     if os.path.exists(LOG_FILE):
         try:
@@ -151,7 +161,7 @@ def append_event(event):
             log.warning("events file unreadable; starting fresh")
             events = []
 
-    events.append(event)
+    events.extend(new_events)
 
     if len(events) > 10000:
         events = events[-10000:]
@@ -211,10 +221,17 @@ def append_chat_messages(new_msgs):
 def process_logs():
     lines = get_docker_logs()
     last_pos = get_last_position()
+    if last_pos > len(lines):
+        # Container was recreated -> docker logs starts over from zero. Without
+        # this reset, every event would be skipped until the fresh log outgrew
+        # the stale position.
+        log.warning("saved position %d is beyond current log length %d "
+                    "(container recreated?) - resetting to 0", last_pos, len(lines))
+        last_pos = 0
     new_lines = lines[last_pos:]
 
     today = datetime.now().strftime("%Y-%m-%d")
-    events_found = 0
+    event_batch = []  # batched event writes — single file write per tick
     chat_batch = []  # batched chat writes — single file write per tick
 
     for line in new_lines:
@@ -225,34 +242,29 @@ def process_logs():
 
         m = PATTERNS["join"].search(line)
         if m:
-            append_event({"timestamp": ts, "time": m.group(1), "type": "JOIN", "player": m.group(2), "ip": m.group(3)})
+            event_batch.append({"timestamp": ts, "time": m.group(1), "type": "JOIN", "player": m.group(2), "ip": m.group(3)})
             log.info("[JOIN] %s %s from %s", ts, m.group(2), m.group(3))
-            events_found += 1
             continue
 
         m = PATTERNS["leave"].search(line)
         if m:
-            append_event({"timestamp": ts, "time": m.group(1), "type": "LEAVE", "player": m.group(2), "ip": ""})
-            events_found += 1
+            event_batch.append({"timestamp": ts, "time": m.group(1), "type": "LEAVE", "player": m.group(2), "ip": ""})
             continue
 
         m = PATTERNS["unknown_connect"].search(line)
         if m:
-            append_event({"timestamp": ts, "time": m.group(1), "type": "REJECTED", "player": m.group(2), "ip": m.group(3), "reason": m.group(4)})
+            event_batch.append({"timestamp": ts, "time": m.group(1), "type": "REJECTED", "player": m.group(2), "ip": m.group(3), "reason": m.group(4)})
             log.info("[REJECTED] %s %s from %s - %s", ts, m.group(2), m.group(3), m.group(4))
-            events_found += 1
             continue
 
         m = PATTERNS["geyser_connect"].search(line)
         if m:
-            append_event({"timestamp": ts, "time": m.group(1), "type": "GEYSER_CONNECT", "player": m.group(2), "ip": ""})
-            events_found += 1
+            event_batch.append({"timestamp": ts, "time": m.group(1), "type": "GEYSER_CONNECT", "player": m.group(2), "ip": ""})
             continue
 
         m = PATTERNS["geyser_disconnect"].search(line)
         if m:
-            append_event({"timestamp": ts, "time": m.group(1), "type": "GEYSER_DISCONNECT", "player": m.group(2), "ip": "", "reason": m.group(3)})
-            events_found += 1
+            event_batch.append({"timestamp": ts, "time": m.group(1), "type": "GEYSER_DISCONNECT", "player": m.group(2), "ip": "", "reason": m.group(3)})
             continue
 
         # Chat — collected and persisted to a separate file
@@ -272,10 +284,12 @@ def process_logs():
             continue
 
     save_position(len(lines))
+    if event_batch:
+        append_events(event_batch)
     if chat_batch:
         append_chat_messages(chat_batch)
     log.info("Processed %d new lines, found %d events, %d chat messages",
-             len(new_lines), events_found, len(chat_batch))
+             len(new_lines), len(event_batch), len(chat_batch))
 
 # --- Metrics Collection ---
 
