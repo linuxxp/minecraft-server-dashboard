@@ -20,6 +20,7 @@ mc-chat-log.json
 mc-onboarding-state.json
 mc-locations.json
 mc-plugin-history.json
+mc-plugin-updates.json
 .mc-web-secret
 .mc-logger-state
 mc-access-web.log

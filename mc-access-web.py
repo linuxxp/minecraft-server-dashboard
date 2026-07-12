@@ -3,8 +3,21 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 2.3.0
+Version: 2.4.0
 Changelog:
+  v2.4.0 (2026-07-12)
+    - Automatic plugin update checker. Each installed plugin is resolved
+      against Modrinth and Hangar (name-matched conservatively - no fuzzy
+      guessing) and the newest build is filtered by the server's software
+      and MC version, both auto-detected via RCON `version` (docker logs
+      fallback) - nothing hardcoded. Results: "X available" badge (click
+      to update in place through the existing staging/SHA-256 pipeline,
+      or open the project page), "latest", "no build for <version>",
+      or a neutral version-differs link. Runs automatically once a day
+      from the watchdog and on demand via the Check updates button, which
+      also shows the detected server software/version and last-check age.
+      New endpoints: GET /api/plugins/updates, POST /api/plugins/check-updates.
+      Results persist in mc-plugin-updates.json.
   v2.3.0 (2026-07-12)
     - Minecraft color theme: grass-green accent, dirt/deepslate browns,
       diamond blue, gold yellow, redstone red. The theme button now cycles
@@ -368,7 +381,7 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 COMPOSE_FILE = "/opt/minecraft/docker-compose.yml"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
@@ -1124,6 +1137,10 @@ def _start_watchdog():
                 auto_ban_tick()
             except Exception:
                 log.exception("auto-ban tick failed")
+            try:
+                plugin_update_autocheck()
+            except Exception:
+                log.exception("plugin update autocheck failed")
 
     t = threading.Thread(target=_tick_forever, daemon=True, name='watchdog')
     t.start()
@@ -2747,6 +2764,279 @@ def api_plugin_history():
     return json.dumps(list(reversed(h))), 200, {'Content-Type': 'application/json'}
 
 # ----------------------------------------------------------------------------
+# Plugin update checker — resolves each installed plugin against Modrinth and
+# Hangar (PaperMC's registry) and compares versions. The server software and
+# MC version are auto-detected (RCON `version`, docker logs fallback) and the
+# registry queries are filtered by them, so only compatible builds are offered.
+# Runs automatically once a day from the watchdog + on demand from /plugins.
+# ----------------------------------------------------------------------------
+PLUGIN_UPDATES_FILE = "/home/pi/mc-plugin-updates.json"
+PLUGIN_CHECK_INTERVAL_HOURS = 24
+
+_update_check_lock = threading.Lock()
+_update_check_running = False
+
+def get_server_info():
+    """Detect server software + MC version. Never hardcoded:
+    1. RCON `version` — Paper answers e.g.
+       'This server is running Paper version 1.21.8-27-main@abc (MC: 1.21.8)'
+    2. Fallback: 'Starting minecraft server version X.Y.Z' in docker logs.
+    Cached 10 minutes. Returns {'software': 'Paper'|'', 'mc_version': '1.21.8'|''}."""
+    def _detect():
+        out = rcon('version')
+        if out and not out.startswith('Error'):
+            m = re.search(r'running\s+(\w+)\s+version', out, re.IGNORECASE)
+            software = m.group(1) if m else ''
+            m = re.search(r'\(MC:\s*([\d.]+)\)', out)
+            mc = m.group(1) if m else ''
+            if not mc:
+                m = re.search(r'version\s+([\d][\d.]*)', out)
+                mc = m.group(1) if m else ''
+            if software or mc:
+                return {'software': software, 'mc_version': mc}
+        try:
+            r = subprocess.run('docker logs minecraft 2>&1 | grep -m1 "Starting minecraft server version"',
+                               shell=True, capture_output=True, text=True, timeout=10)
+            m = re.search(r'version\s+([\d.]+)', strip_ansi(r.stdout or ''))
+            if m:
+                return {'software': '', 'mc_version': m.group(1)}
+        except Exception:
+            log.exception("server version detect via docker logs failed")
+        return {'software': '', 'mc_version': ''}
+    return cached('server_info', 600, _detect)
+
+def _http_get_json(url, timeout=8):
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            'User-Agent': f'mc-access-web/{VERSION} (minecraft-server-dashboard)',
+            'Accept': 'application/json',
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        log.debug("http get failed: %s", url, exc_info=True)
+        return None
+
+def _api_loaders(software):
+    """Loader names for registry queries, detected software first."""
+    base = ['paper', 'spigot', 'bukkit']
+    s = (software or '').lower()
+    if s and s not in base:
+        base.insert(0, s)  # purpur, folia, ...
+    return base
+
+def _name_variants(name):
+    """Normalized forms used to match a plugin against registry search hits."""
+    n = _normalize_plugin_name(name)
+    variants = {n}
+    stripped = re.sub(r'(spigot|bukkit|paper|velocity)$', '', n)
+    if stripped:
+        variants.add(stripped)
+    return variants
+
+def _version_tuple(s):
+    nums = re.findall(r'\d+', s or '')
+    return tuple(int(x) for x in nums[:4]) if nums else None
+
+def _compare_versions(current, latest):
+    """'update' when latest > current, 'current' when same/older, 'differs'
+    when the strings can't be ordered numerically."""
+    if not latest:
+        return 'differs'
+    if not current or current == '?':
+        return 'differs'
+    ct, lt = _version_tuple(current), _version_tuple(latest)
+    if ct is None or lt is None:
+        return 'current' if current.strip() == latest.strip() else 'differs'
+    length = max(len(ct), len(lt))
+    ct = ct + (0,) * (length - len(ct))
+    lt = lt + (0,) * (length - len(lt))
+    return 'update' if lt > ct else 'current'
+
+def _modrinth_check(name, mc_version, loaders):
+    from urllib.parse import quote
+    data = _http_get_json(
+        f'https://api.modrinth.com/v2/search?query={quote(name)}'
+        f'&facets={quote(json.dumps([["project_type:plugin"]]))}&limit=5')
+    hits = (data or {}).get('hits') or []
+    variants = _name_variants(name)
+    slug = None
+    for h in hits:
+        if _normalize_plugin_name(h.get('title', '')) in variants or \
+           _normalize_plugin_name(h.get('slug', '')) in variants:
+            slug = h.get('slug')
+            break
+    if not slug:
+        return None
+    base = f'https://api.modrinth.com/v2/project/{slug}/version?loaders={quote(json.dumps(loaders))}'
+    versions = None
+    compatible = True
+    if mc_version:
+        versions = _http_get_json(base + f'&game_versions={quote(json.dumps([mc_version]))}')
+    if not versions:
+        versions = _http_get_json(base)
+        compatible = False if mc_version else True
+    if not versions:
+        return None
+    v = versions[0]
+    files = v.get('files') or [{}]
+    return {
+        'latest': v.get('version_number', ''),
+        'source': 'modrinth',
+        'project_url': f'https://modrinth.com/plugin/{slug}',
+        'download_url': files[0].get('url', ''),
+        'compatible': compatible,
+    }
+
+def _hangar_check(name, mc_version):
+    from urllib.parse import quote
+    data = _http_get_json(f'https://hangar.papermc.io/api/v1/projects?q={quote(name)}&limit=5')
+    results = (data or {}).get('result') or []
+    variants = _name_variants(name)
+    slug = owner = None
+    for h in results:
+        ns = h.get('namespace') or {}
+        if _normalize_plugin_name(h.get('name', '')) in variants or \
+           _normalize_plugin_name(ns.get('slug', '')) in variants:
+            slug, owner = ns.get('slug'), ns.get('owner')
+            break
+    if not slug:
+        return None
+    base = f'https://hangar.papermc.io/api/v1/projects/{quote(slug)}/versions?limit=1&platform=PAPER'
+    versions = None
+    compatible = True
+    if mc_version:
+        versions = _http_get_json(base + f'&platformVersion={quote(mc_version)}')
+        if not (versions or {}).get('result'):
+            versions = None
+    if not versions:
+        versions = _http_get_json(base)
+        compatible = False if mc_version else True
+    v = ((versions or {}).get('result') or [None])[0]
+    if not v:
+        return None
+    dl = (v.get('downloads') or {}).get('PAPER') or {}
+    return {
+        'latest': v.get('name', ''),
+        'source': 'hangar',
+        'project_url': f'https://hangar.papermc.io/{owner}/{slug}',
+        'download_url': dl.get('downloadUrl') or dl.get('externalUrl') or '',
+        'compatible': compatible,
+    }
+
+def _check_one_plugin(p, info):
+    name = p.get('name', '')
+    current = p.get('version', '?')
+    loaders = _api_loaders(info.get('software'))
+    mc_version = info.get('mc_version', '')
+    try:
+        found = _modrinth_check(name, mc_version, loaders) or _hangar_check(name, mc_version)
+    except Exception:
+        log.exception("update check failed for %r", name)
+        found = None
+    if not found:
+        return {'current': current, 'status': 'no_match'}
+    status = _compare_versions(current, found['latest'])
+    if status == 'update' and not found.get('compatible', True):
+        status = 'no_compat'  # newer exists but not marked for our MC version
+    return {
+        'current': current,
+        'latest': found['latest'],
+        'source': found['source'],
+        'project_url': found['project_url'],
+        'download_url': found['download_url'],
+        'compatible': found.get('compatible', True),
+        'status': status,
+    }
+
+def load_plugin_updates():
+    if os.path.exists(PLUGIN_UPDATES_FILE):
+        try:
+            with open(PLUGIN_UPDATES_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            log.exception("plugin updates file read failed")
+    return {}
+
+def run_plugin_update_check():
+    """Check every installed plugin against the registries. Returns the result
+    dict, or None if a check is already in progress."""
+    global _update_check_running
+    with _update_check_lock:
+        if _update_check_running:
+            return None
+        _update_check_running = True
+    try:
+        info = get_server_info()
+        plugins = get_plugins_list()
+        results = {}
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {ex.submit(_check_one_plugin, p, info): p for p in plugins}
+            for fut in as_completed(futures):
+                p = futures[fut]
+                try:
+                    results[p['name'].lower()] = {'name': p['name'], **fut.result()}
+                except Exception:
+                    log.exception("update check future failed for %r", p.get('name'))
+        data = {
+            'checked_at': datetime.now().replace(microsecond=0).isoformat(),
+            'server': info,
+            'results': results,
+        }
+        try:
+            atomic_write_json(PLUGIN_UPDATES_FILE, data, indent=2)
+        except Exception:
+            log.exception("plugin updates file write failed")
+        updates = sum(1 for r in results.values() if r.get('status') == 'update')
+        log.info("plugin update check done: %d plugins, %d updates available (server: %s %s)",
+                 len(results), updates, info.get('software') or '?', info.get('mc_version') or '?')
+        return data
+    finally:
+        with _update_check_lock:
+            _update_check_running = False
+
+def plugin_update_autocheck():
+    """Watchdog hook: run the check when the last one is older than a day."""
+    data = load_plugin_updates()
+    checked = data.get('checked_at', '')
+    if checked:
+        try:
+            age = datetime.now() - datetime.fromisoformat(checked)
+            if age < timedelta(hours=PLUGIN_CHECK_INTERVAL_HOURS):
+                return
+        except ValueError:
+            pass
+    run_plugin_update_check()
+
+@app.route('/api/plugins/updates')
+@requires_auth
+def api_plugin_updates():
+    data = load_plugin_updates()
+    data['server_now'] = get_server_info()
+    data['check_running'] = _update_check_running
+    return json.dumps(data), 200, {'Content-Type': 'application/json'}
+
+@app.route('/api/plugins/check-updates', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_plugin_check_updates():
+    data = run_plugin_update_check()
+    if data is None:
+        return _respond('An update check is already running', redirect_to='/plugins', toast='warning')
+    results = data.get('results', {})
+    updates = sum(1 for r in results.values() if r.get('status') == 'update')
+    info = data.get('server', {})
+    msg = (f'Checked {len(results)} plugins against Modrinth/Hangar for '
+           f'{info.get("software") or "server"} {info.get("mc_version") or "?"}: '
+           f'{updates} update(s) available')
+    if _wants_json():
+        return {'ok': True, 'message': msg, 'toast': 'success' if updates == 0 else 'warning',
+                'data': data}, 200
+    return _respond(msg, redirect_to='/plugins', toast='info')
+
+# ----------------------------------------------------------------------------
 # Location bookmarks — named (X, Y, Z) coordinates persisted to JSON.
 # Used as one-tap presets in the Teleport modal on /players.
 # ----------------------------------------------------------------------------
@@ -3265,6 +3555,17 @@ PLUGINS_TEMPLATE = """
         .recent-badge { display: inline-block; font-size: 0.7em; padding: 2px 8px; border-radius: 10px; margin-left: 6px; background: var(--tag-join-bg); color: var(--accent); }
         .recent-badge.recent-fail { background: var(--tag-reject-bg); color: var(--red); }
 
+        /* Update-availability badges (registry check) */
+        .update-check-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; background: var(--bg2); border: 1px solid var(--border3); border-radius: 10px; padding: 8px 14px; margin-bottom: 14px; font-size: 0.85em; color: var(--text2); }
+        .update-check-bar strong { color: var(--accent); }
+        .update-check-bar .ucb-sep { color: var(--text3); }
+        .update-check-bar #updSummary { color: var(--yellow); font-weight: 600; }
+        .upd-badge { display: inline-block; font-size: 0.7em; padding: 2px 8px; border-radius: 10px; margin-left: 6px; cursor: default; }
+        .upd-badge.upd-new { background: var(--tag-gdiscon-bg); color: var(--yellow); cursor: pointer; border: 1px solid var(--yellow); }
+        .upd-badge.upd-ok { background: var(--tag-join-bg); color: var(--accent); opacity: 0.8; }
+        .upd-badge.upd-info { background: var(--tag-geyser-bg); color: var(--blue); cursor: pointer; }
+        .upd-badge.upd-nocompat { background: var(--tag-leave-bg); color: var(--text2); }
+
         /* Update history list */
         .history-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
         .history-row { background: var(--bg2); border: 1px solid var(--border3); border-left: 3px solid var(--accent); border-radius: 6px; padding: 8px 12px; font-size: 0.85em; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
@@ -3323,6 +3624,14 @@ PLUGINS_TEMPLATE = """
 
     <div class="plugin-stats">
         __STATS__
+    </div>
+
+    <div class="update-check-bar">
+        <span>Server: <strong id="srvInfo">detecting...</strong></span>
+        <span class="ucb-sep">&middot;</span>
+        <span>Updates checked: <span id="updChecked">never</span></span>
+        <button id="checkUpdatesBtn" class="btn btn-update">&#x1F50D; Check updates</button>
+        <span id="updSummary"></span>
     </div>
 
     <div class="plugin-toolbar">
@@ -3521,6 +3830,90 @@ PLUGINS_TEMPLATE = """
                 .catch(function(){});
         }
         document.addEventListener('DOMContentLoaded', refreshHistory);
+
+        // ---- Registry update check (Modrinth/Hangar, filtered by server version) ----
+        function renderUpdates(data) {
+            data = data || {};
+            var srv = data.server_now || data.server || {};
+            var srvTxt = ((srv.software || '?') + ' ' + (srv.mc_version || '?')).trim();
+            document.getElementById('srvInfo').textContent = srvTxt === '? ?' ? 'unknown (server offline?)' : srvTxt;
+            document.getElementById('updChecked').textContent = data.checked_at ? fmtAgoShort(data.checked_at) : 'never';
+            var results = data.results || {};
+            var updCount = 0;
+            document.querySelectorAll('.plugin-card').forEach(function(card) {
+                var old = card.querySelector('.upd-badge');
+                if (old) old.remove();
+                var r = results[card.dataset.name];
+                if (!r) return;
+                var badge = document.createElement('span');
+                badge.className = 'upd-badge';
+                if (r.status === 'update') {
+                    updCount++;
+                    badge.classList.add('upd-new');
+                    badge.textContent = '⬆ ' + r.latest + ' available';
+                    badge.title = 'Found on ' + r.source + (r.download_url ? ' - click to update now' : ' - click to open project page');
+                    badge.addEventListener('click', function() {
+                        if (r.download_url) {
+                            if (!confirm('Update ' + r.name + ' to ' + r.latest + ' from ' + r.source + '?\n\n' + r.download_url)) return;
+                            var input = card.querySelector('input[name="url"]');
+                            var form = card.querySelector('form.plugin-url-form');
+                            if (input && form) { input.value = r.download_url; form.requestSubmit(); }
+                        } else if (r.project_url) {
+                            window.open(r.project_url, '_blank');
+                        }
+                    });
+                } else if (r.status === 'current') {
+                    badge.classList.add('upd-ok');
+                    badge.textContent = '✓ latest';
+                    badge.title = 'Up to date per ' + r.source;
+                } else if (r.status === 'no_compat') {
+                    badge.classList.add('upd-nocompat');
+                    badge.textContent = 'no build for ' + ((data.server || {}).mc_version || 'this version');
+                    badge.title = 'Newest on ' + r.source + ' is ' + r.latest + ' but not marked compatible';
+                } else if (r.status === 'differs' && r.latest) {
+                    badge.classList.add('upd-info');
+                    badge.textContent = r.latest + ' on ' + r.source;
+                    badge.title = 'Version strings differ - click to open project page';
+                    badge.addEventListener('click', function() { if (r.project_url) window.open(r.project_url, '_blank'); });
+                } else {
+                    return; // no_match: no badge
+                }
+                var nameEl = card.querySelector('.plugin-name');
+                if (nameEl) nameEl.appendChild(badge);
+            });
+            document.getElementById('updSummary').textContent =
+                updCount > 0 ? ('⬆ ' + updCount + ' update' + (updCount > 1 ? 's' : '') + ' available') : '';
+        }
+
+        function refreshUpdates() {
+            fetch('/api/plugins/updates', { headers: { 'X-Requested-With': 'fetch' } })
+                .then(function(r){ return r.json(); })
+                .then(renderUpdates)
+                .catch(function(){});
+        }
+        document.addEventListener('DOMContentLoaded', refreshUpdates);
+
+        document.getElementById('checkUpdatesBtn').addEventListener('click', function() {
+            var btn = this;
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
+            var fd = new FormData();
+            fd.append('csrf_token', CSRF_TOKEN);
+            fetch('/api/plugins/check-updates', {
+                method: 'POST', body: fd,
+                headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+            }).then(function(r){ return r.json(); })
+              .then(function(d) {
+                  btn.disabled = false;
+                  btn.innerHTML = '&#x1F50D; Check updates';
+                  showToast(d.message || 'Done', d.toast || 'info', 12000);
+                  if (d.data) renderUpdates(d.data); else refreshUpdates();
+              }).catch(function(err) {
+                  btn.disabled = false;
+                  btn.innerHTML = '&#x1F50D; Check updates';
+                  showToast('Network: ' + err, 'error');
+              });
+        });
 
         // Update All — sequential, with one toast per plugin
         document.getElementById('updateAllBtn').addEventListener('click', function() {

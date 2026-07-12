@@ -27,6 +27,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 
 - Live grid of installed plugins with version, file, size, status badge. Plugin list is parsed from the Paper startup line in docker logs, with automatic fallbacks to RCON `plugins` and to scanning `plugins/*.jar` when the log has been rotated or the container recreated
 - Search by name, sort (name/size/status), filter (all / no URL / has URL / JAR missing)
+- **Automatic update checker** — every plugin is resolved against Modrinth and Hangar, filtered by the server's software and MC version (auto-detected via RCON `version`, never hardcoded). Cards get an "⬆ X available" badge (one click updates in place), "✓ latest", or "no build for \<version\>". Runs daily via the watchdog + on-demand button showing the detected server version and last-check age
 - Per-plugin update via saved URL — downloads to staging, SHA-256 compares, **discards if identical** (no unnecessary restart)
 - Update All — sequential per-plugin downloads with individual toasts and final summary
 - **Recent updates** list with old/new size and signed delta (e.g. `+304 KB`)
@@ -259,6 +260,7 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | GET | `/api/plugins/history` | Last 50 plugin update events |
 | GET | `/api/bans` | Banned IPs (newest first) |
 | GET | `/api/backups/status` | Running/last backup job state |
+| GET | `/api/plugins/updates` | Cached update-check results + detected server info |
 
 ### Write APIs (require CSRF)
 
@@ -277,6 +279,7 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | POST | `/api/locations/remove` | `name` |
 | POST | `/api/plugins/update` | `file`, `url` (downloads, SHA-256 dedupes) |
 | POST | `/api/plugins/update-all` | Iterates all saved URLs |
+| POST | `/api/plugins/check-updates` | Check all plugins against Modrinth/Hangar |
 | POST | `/api/backups/create` | Start a backup job (background thread) |
 | POST | `/api/backups/restore` | `filename` — stop server, safety-archive current world, extract, start |
 | POST | `/api/backups/delete` | `filename` (must match `world-*.tar.gz`) |
@@ -311,6 +314,7 @@ Runtime files (created automatically, excluded from git):
 | `~/mc-locations.json` | Saved teleport bookmarks |
 | `~/mc-plugin-urls.json` | Plugin filename -> download URL map |
 | `~/mc-plugin-history.json` | Last 50 plugin update events |
+| `~/mc-plugin-updates.json` | Registry update-check results + detected server info |
 | `~/mc-web-auth.json` | Dashboard credentials (auto-created, mode 0600) |
 | `~/mc-banned-ips.json` | Banned IPs with country/date/method |
 | `~/.mc-web-secret` | Flask session secret (32 random bytes, mode 0600) |
