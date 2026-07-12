@@ -3,8 +3,15 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 2.2.0
+Version: 2.3.0
 Changelog:
+  v2.3.0 (2026-07-12)
+    - Minecraft color theme: grass-green accent, dirt/deepslate browns,
+      diamond blue, gold yellow, redstone red. The theme button now cycles
+      dark -> light -> minecraft (icon shows the next theme: sun / pickaxe /
+      moon), persisted in the same theme cookie. The mc theme aliases the
+      dark variable set and overrides on top, so any variable missed by the
+      override falls back to a sane dark value instead of breaking.
   v2.2.0 (2026-07-12)
     - Backup restore: per-archive Restore button on /backups. Flow (background
       thread, live status): stop the server via docker compose -> archive the
@@ -361,7 +368,7 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 COMPOSE_FILE = "/opt/minecraft/docker-compose.yml"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
@@ -1747,11 +1754,12 @@ CHARTS_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
-        :root[data-theme="dark"] {
+        :root[data-theme="dark"], :root[data-theme="mc"] {
             --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460;
             --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3;
             --border2: #333; --red: #e74c3c; --blue: #48bfe3; --yellow: #e7a33c;
         }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] {
             --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1;
             --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f;
@@ -1785,14 +1793,15 @@ CHARTS_TEMPLATE = """
     <script>
         function toggleTheme() {
             var html = document.documentElement;
-            var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            var cur = html.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : (cur === 'light' ? 'mc' : 'dark');
             html.setAttribute('data-theme', next);
             document.cookie = 'theme=' + next + ';path=/;max-age=31536000';
-            document.getElementById('themeIcon').innerHTML = next === 'dark' ? '&#x2600;' : '&#x1F319;';
+            document.getElementById('themeIcon').innerHTML = next === 'dark' ? '&#x2600;' : (next === 'light' ? '&#x26CF;&#xFE0F;' : '&#x1F319;');
             if (window.metricsChart) updateChartColors();
         }
         (function() {
-            var match = document.cookie.match(/theme=(dark|light)/);
+            var match = document.cookie.match(/theme=(dark|light|mc)/);
             if (match) document.documentElement.setAttribute('data-theme', match[1]);
         })();
     </script>
@@ -1868,7 +1877,7 @@ CHARTS_TEMPLATE = """
         var metricsChart = null;
 
         function getColors() {
-            var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            var isDark = document.documentElement.getAttribute('data-theme') !== 'light';
             return {
                 cpu: '#e74c3c',
                 ram: '#e7a33c',
@@ -2053,9 +2062,9 @@ CHARTS_TEMPLATE = """
         window.addEventListener('load', function() {
             loadData(1, document.querySelector('.range-btn.active'));
             // Fix theme icon
-            var match = document.cookie.match(/theme=(dark|light)/);
+            var match = document.cookie.match(/theme=(dark|light|mc)/);
             var theme = match ? match[1] : 'dark';
-            document.getElementById('themeIcon').innerHTML = theme === 'dark' ? '&#x2600;' : '&#x1F319;';
+            document.getElementById('themeIcon').innerHTML = theme === 'dark' ? '&#x2600;' : (theme === 'light' ? '&#x26CF;&#xFE0F;' : '&#x1F319;');
 
             // ----- Per-player playtime chart -----
             populatePlayerSelect();
@@ -3202,7 +3211,8 @@ PLUGINS_TEMPLATE = """
     <title>MC Plugins</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --msg-bg: #1b3a4b; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --msg-bg: #1b3a4b; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --msg-bg: #d1ecf1; --tag-join-bg: #d5f5e3; --tag-reject-bg: #fadbd8; --tag-gdiscon-bg: #fcf3cf; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -3284,8 +3294,8 @@ PLUGINS_TEMPLATE = """
     </style>
     <script>
         var CSRF_TOKEN = '__CSRF__';
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
     </script>
 </head>
 <body>
@@ -3611,7 +3621,7 @@ PLUGINS_TEMPLATE = """
               });
         });
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body></html>
 """
@@ -3625,7 +3635,8 @@ PLAYERS_TEMPLATE = """
     <title>MC Players</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -3709,8 +3720,8 @@ PLAYERS_TEMPLATE = """
         @media (max-width: 600px) { body { padding: 12px; } .player-grid { grid-template-columns: 1fr; } .player-stats { grid-template-columns: 1fr; } }
     </style>
     <script>
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
     </script>
 </head>
 <body>
@@ -4036,7 +4047,7 @@ PLAYERS_TEMPLATE = """
             });
         });
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body></html>
 """
@@ -4386,7 +4397,8 @@ BACKUPS_TEMPLATE = """
     <title>MC Backups</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; --msg-bg: #1b3a4b; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; --msg-bg: #1b3a4b; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --tag-join-bg: #d5f5e3; --tag-reject-bg: #fadbd8; --tag-gdiscon-bg: #fcf3cf; --msg-bg: #d6eaf8; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -4443,8 +4455,8 @@ BACKUPS_TEMPLATE = """
         .toast.toast-info { background: #2980b9; }
         .toast .toast-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 1.2em; line-height: 1; opacity: 0.7; padding: 0; margin-left: auto; }
     </style>
-    <script>(function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.documentElement.setAttribute('data-theme',t);})();
-        function toggleTheme() { var h=document.documentElement; var n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+    <script>(function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.documentElement.setAttribute('data-theme',t);})();
+        function toggleTheme() { var h=document.documentElement; var c=h.getAttribute('data-theme'); var n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
     </script>
 </head>
 <body>
@@ -4597,7 +4609,7 @@ BACKUPS_TEMPLATE = """
         // If a backup is already running when the page opens, show progress
         pollBackupStatus();
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body>
 </html>
@@ -4622,7 +4634,8 @@ LOGS_TEMPLATE = """
     <title>MC Logs</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --info-bg: #1b3a4b; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --info-bg: #1b3a4b; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --info-bg: #d6eaf8; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -4662,8 +4675,8 @@ LOGS_TEMPLATE = """
         @media (max-width: 600px) { body { padding: 12px; } .log-time { min-width: 90px; } .log-line { font-size: 0.7em; } }
     </style>
     <script>
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
     </script>
 </head>
 <body>
@@ -4806,7 +4819,7 @@ LOGS_TEMPLATE = """
             box.scrollTop = box.scrollHeight;
         });
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body>
 </html>
@@ -4848,7 +4861,8 @@ CONSOLE_TEMPLATE = """
     <title>MC Console</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -4875,8 +4889,8 @@ CONSOLE_TEMPLATE = """
     </style>
     <script>
         var CSRF_TOKEN = '__CSRF__';
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
     </script>
 </head>
 <body>
@@ -4957,7 +4971,7 @@ CONSOLE_TEMPLATE = """
             }
         });
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body>
 </html>
@@ -4985,7 +4999,8 @@ BANS_TEMPLATE = """
     <title>MC Bans</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; --msg-bg: #1b3a4b; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --tag-join-bg: #1b4332; --tag-reject-bg: #3d1111; --tag-gdiscon-bg: #3d2911; --msg-bg: #1b3a4b; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --tag-join-bg: #d5f5e3; --tag-reject-bg: #fadbd8; --tag-gdiscon-bg: #fcf3cf; --msg-bg: #d6eaf8; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -5031,8 +5046,8 @@ BANS_TEMPLATE = """
     </style>
     <script>
         var CSRF_TOKEN = '__CSRF__';
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
     </script>
 </head>
 <body>
@@ -5172,7 +5187,7 @@ BANS_TEMPLATE = """
         });
 
         loadBans();
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body>
 </html>
@@ -5199,7 +5214,8 @@ CHAT_TEMPLATE = """
     <title>MC Chat</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --info-bg: #1b3a4b; }
+        :root[data-theme="dark"], :root[data-theme="mc"] { --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3; --border2: #333; --border3: #1e3050; --blue: #48bfe3; --yellow: #e7a33c; --red: #e74c3c; --info-bg: #1b3a4b; }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] { --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f; --border2: #ccc; --border3: #ddd; --blue: #2980b9; --yellow: #d4a017; --red: #c0392b; --info-bg: #d6eaf8; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; font-size: 15px; }
@@ -5249,8 +5265,8 @@ CHAT_TEMPLATE = """
     </style>
     <script>
         var CSRF_TOKEN = '__CSRF__';
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
-        function toggleTheme() { var h=document.documentElement,n=h.getAttribute('data-theme')==='dark'?'light':'dark'; h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':'&#x1F319;'; }
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);if(m)document.documentElement.setAttribute('data-theme',m[1]);})();
+        function toggleTheme() { var h=document.documentElement,c=h.getAttribute('data-theme'),n=c==='dark'?'light':(c==='light'?'mc':'dark'); h.setAttribute('data-theme',n); document.cookie='theme='+n+';path=/;max-age=31536000'; document.getElementById('themeIcon').innerHTML=n==='dark'?'&#x2600;':(n==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;'); }
     </script>
 </head>
 <body>
@@ -5451,7 +5467,7 @@ CHAT_TEMPLATE = """
         });
         autoTimer = setInterval(loadChat, 5000);
 
-        (function(){var m=document.cookie.match(/theme=(dark|light)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':'&#x1F319;';})();
+        (function(){var m=document.cookie.match(/theme=(dark|light|mc)/);var t=m?m[1]:'dark';document.getElementById('themeIcon').innerHTML=t==='dark'?'&#x2600;':(t==='light'?'&#x26CF;&#xFE0F;':'&#x1F319;');})();
     </script>
 </body>
 </html>
@@ -5683,7 +5699,7 @@ HTML_TEMPLATE = """
     <title>MC Access Log</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,__FAVICON__">
     <style>
-        :root[data-theme="dark"] {
+        :root[data-theme="dark"], :root[data-theme="mc"] {
             --bg: #1a1a2e; --bg2: #16213e; --bg3: #0f3460; --bg-hover: #1a2744;
             --text: #e0e0e0; --text2: #888; --text3: #555; --accent: #4ecca3;
             --border: #1a1a2e; --border2: #333; --border3: #1e3050;
@@ -5695,6 +5711,7 @@ HTML_TEMPLATE = """
             --alert-bg: #3d1111; --alert-border: #e74c3c;
             --msg-bg: #1b3a4b;
         }
+        :root[data-theme="mc"] { --bg: #1d1812; --bg2: #2b2318; --bg3: #3d3020; --bg-hover: #352b1c; --text: #ede4d3; --text2: #a99f88; --text3: #6f6450; --accent: #6abe30; --border: #2b2318; --border2: #4d3f2a; --border3: #3a2f1f; --red: #ff5555; --blue: #4aedd9; --yellow: #ffd83d; --bar-bg: #17130e; --row-rejected-bg: #3a1a12; --row-rejected-hover: #472016; --input-bg: #2b2318; --tag-join-bg: #2c4416; --tag-leave-bg: #3a3428; --tag-reject-bg: #4a1c12; --tag-geyser-bg: #173f3a; --tag-gdiscon-bg: #4a3a10; --chart-from: #3d3020; --chart-to: #6abe30; --alert-bg: #4a1c12; --alert-border: #ff5555; --msg-bg: #173f3a; --info-bg: #173f3a; }
         :root[data-theme="light"] {
             --bg: #f0f2f5; --bg2: #ffffff; --bg3: #e8ecf1; --bg-hover: #e3e8ef;
             --text: #1a1a2e; --text2: #666; --text3: #999; --accent: #2d8f6f;
@@ -5885,10 +5902,11 @@ HTML_TEMPLATE = """
         }
         function toggleTheme() {
             var html = document.documentElement;
-            var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            var cur = html.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : (cur === 'light' ? 'mc' : 'dark');
             html.setAttribute('data-theme', next);
             document.cookie = 'theme=' + next + ';path=/;max-age=31536000';
-            document.getElementById('themeIcon').innerHTML = next === 'dark' ? '&#x2600;' : '&#x1F319;';
+            document.getElementById('themeIcon').innerHTML = next === 'dark' ? '&#x2600;' : (next === 'light' ? '&#x26CF;&#xFE0F;' : '&#x1F319;');
         }
         function removePlayer(name) {
             if (confirm('Remove ' + name + ' from whitelist?')) {
@@ -5934,7 +5952,7 @@ HTML_TEMPLATE = """
             box.style.display = 'none';
         }
         (function() {
-            var match = document.cookie.match(/theme=(dark|light)/);
+            var match = document.cookie.match(/theme=(dark|light|mc)/);
             if (match) document.documentElement.setAttribute('data-theme', match[1]);
             // Hide alert if dismissed and IP signature unchanged
             document.addEventListener('DOMContentLoaded', function() {
@@ -6324,9 +6342,9 @@ HTML_TEMPLATE = """
         }
 
         (function() {
-            var match = document.cookie.match(/theme=(dark|light)/);
+            var match = document.cookie.match(/theme=(dark|light|mc)/);
             var theme = match ? match[1] : 'dark';
-            document.getElementById('themeIcon').innerHTML = theme === 'dark' ? '&#x2600;' : '&#x1F319;';
+            document.getElementById('themeIcon').innerHTML = theme === 'dark' ? '&#x2600;' : (theme === 'light' ? '&#x26CF;&#xFE0F;' : '&#x1F319;');
 
             // Initial state and 5s poller
             window._lastOnboardingActive = !!document.getElementById('onboardingBox');

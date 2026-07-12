@@ -81,7 +81,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 **General**
 
 - Whitelist ON/OFF live indicator on the dashboard (reads `server.properties`)
-- Dark/light theme toggle with cookie persistence
+- Three color themes with cookie persistence — dark, light and **Minecraft** (grass green / dirt brown / diamond / gold / redstone); the theme button cycles through them (sun / pickaxe / moon icons)
 - Mobile-responsive
 - HTTP Basic Auth
 - CSRF protection on every POST endpoint
