@@ -3,8 +3,21 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 2.4.0
+Version: 2.4.1
 Changelog:
+  v2.4.1 (2026-07-12)
+    - FIX: /plugins page JS was dead ("Server: detecting..." never resolved,
+      search/sort/badges inert). An unescaped \n inside the update-confirm
+      string became a real newline in the served JavaScript (Python string
+      escape), which is a SyntaxError that killed the whole script block.
+      All 9 templates' scripts are now syntax-checked with node as part of
+      the fix.
+    - FIX: bans recorded while ufw was unusable (missing sudoers entry at
+      ban time) stayed method=rcon forever, so the ban list and `ufw status`
+      disagreed. The watchdog now promotes rcon-method bans to real ufw
+      rules automatically (idempotent) as soon as ufw becomes available.
+      /bans shows a live "Firewall (ufw via sudo): working / UNAVAILABLE"
+      indicator so a missing sudoers entry is visible instead of silent.
   v2.4.0 (2026-07-12)
     - Automatic plugin update checker. Each installed plugin is resolved
       against Modrinth and Hangar (name-matched conservatively - no fuzzy
@@ -381,7 +394,7 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 COMPOSE_FILE = "/opt/minecraft/docker-compose.yml"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
@@ -1137,6 +1150,10 @@ def _start_watchdog():
                 auto_ban_tick()
             except Exception:
                 log.exception("auto-ban tick failed")
+            try:
+                migrate_bans_to_ufw()
+            except Exception:
+                log.exception("ban migration to ufw failed")
             try:
                 plugin_update_autocheck()
             except Exception:
@@ -3170,24 +3187,66 @@ def lookup_ip_country(ip):
         log.debug("country lookup failed for %s", ip, exc_info=True)
     return '', ''
 
-def _fw_ban(ip):
-    """Ban an IP. Returns (method, detail). Tries ufw first, falls back to RCON."""
+def _ufw_available():
+    """True when the dashboard user can run ufw via passwordless sudo.
+    Cached 60s; surfaced on /bans so a missing sudoers entry is visible."""
+    def _probe():
+        try:
+            r = subprocess.run(['sudo', '-n', 'ufw', 'status'],
+                               capture_output=True, text=True, timeout=8)
+            return r.returncode == 0
+        except Exception:
+            log.debug("ufw availability probe failed", exc_info=True)
+            return False
+    return cached('ufw_available', 60, _probe)
+
+def _ufw_ban(ip):
+    """Add a ufw deny rule. Returns detail string on success, None on failure."""
     try:
         r = subprocess.run(['sudo', '-n', 'ufw', 'insert', '1', 'deny', 'from', ip, 'to', 'any'],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
-            return 'ufw', (r.stdout or '').strip()[:100]
+            return (r.stdout or 'rule added').strip()[:100]
         # `insert 1` fails on an empty ruleset; plain deny appends instead
         r = subprocess.run(['sudo', '-n', 'ufw', 'deny', 'from', ip, 'to', 'any'],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
-            return 'ufw', (r.stdout or '').strip()[:100]
+            return (r.stdout or 'rule added').strip()[:100]
         log.warning("ufw ban failed for %s rc=%d stderr=%s (sudoers entry missing?)",
                     ip, r.returncode, (r.stderr or '').strip()[:200])
     except Exception:
         log.exception("ufw ban failed for %s", ip)
+    return None
+
+def _fw_ban(ip):
+    """Ban an IP. Returns (method, detail). Tries ufw first, falls back to RCON."""
+    detail = _ufw_ban(ip)
+    if detail is not None:
+        return 'ufw', detail
     result = rcon(f'ban-ip {ip}')
     return 'rcon', (result or '')[:100]
+
+def migrate_bans_to_ufw():
+    """Watchdog hook: bans recorded with the RCON fallback (ufw was unusable
+    at ban time, e.g. sudoers entry added later) get promoted to real firewall
+    rules as soon as ufw becomes available. Idempotent - ufw skips existing
+    rules with rc=0."""
+    bans = load_banned_ips()
+    pending = [b for b in bans if b.get('method') != 'ufw' and IP_RE.match(b.get('ip', ''))]
+    if not pending:
+        return
+    if not _ufw_available():
+        return
+    migrated = 0
+    for b in pending:
+        detail = _ufw_ban(b['ip'])
+        if detail is not None:
+            b['method'] = 'ufw'
+            b['detail'] = detail
+            migrated += 1
+    if migrated:
+        save_banned_ips(bans)
+        log.info("migrated %d ban(s) from rcon to ufw", migrated)
 
 def _fw_unban(ip, method):
     """Undo a ban made by _fw_ban. Returns detail string."""
@@ -3250,7 +3309,10 @@ def api_bans_list():
     bans = load_banned_ips()
     # Newest first
     bans = sorted(bans, key=lambda b: b.get('banned_at', ''), reverse=True)
-    return json.dumps(bans), 200, {'Content-Type': 'application/json'}
+    return json.dumps({
+        'bans': bans,
+        'ufw_available': _ufw_available(),
+    }), 200, {'Content-Type': 'application/json'}
 
 @app.route('/api/bans/add', methods=['POST'])
 @requires_auth
@@ -3854,7 +3916,7 @@ PLUGINS_TEMPLATE = """
                     badge.title = 'Found on ' + r.source + (r.download_url ? ' - click to update now' : ' - click to open project page');
                     badge.addEventListener('click', function() {
                         if (r.download_url) {
-                            if (!confirm('Update ' + r.name + ' to ' + r.latest + ' from ' + r.source + '?\n\n' + r.download_url)) return;
+                            if (!confirm('Update ' + r.name + ' to ' + r.latest + ' from ' + r.source + '?\\n\\n' + r.download_url)) return;
                             var input = card.querySelector('input[name="url"]');
                             var form = card.querySelector('form.plugin-url-form');
                             if (input && form) { input.value = r.download_url; form.requestSubmit(); }
@@ -5462,7 +5524,9 @@ BANS_TEMPLATE = """
         Auto-ban is <strong>__AUTO_BAN_STATE__</strong>: IPs reaching <strong>__AUTO_BAN_THRESHOLD__</strong> rejected connection
         attempts are banned automatically (never IPs that had a successful join, never private ranges).
         Preferred method is <code>ufw</code> (needs a sudoers entry, see README); falls back to RCON <code>ban-ip</code>
-        which only blocks the game port.
+        which only blocks the game port. Bans made while ufw was unavailable are promoted to firewall rules
+        automatically (within ~30s) once ufw starts working.
+        <div style="margin-top:6px;">Firewall (ufw via sudo): <strong id="ufwState">checking...</strong></div>
     </div>
 
     <div class="ban-form">
@@ -5504,7 +5568,18 @@ BANS_TEMPLATE = """
         function loadBans() {
             fetch('/api/bans', { headers: { 'X-Requested-With': 'fetch' } })
                 .then(function(r){ return r.json(); })
-                .then(function(arr) {
+                .then(function(data) {
+                    var arr = Array.isArray(data) ? data : (data.bans || []);
+                    var ufwEl = document.getElementById('ufwState');
+                    if (ufwEl && !Array.isArray(data)) {
+                        if (data.ufw_available) {
+                            ufwEl.textContent = 'working - bans block at the firewall';
+                            ufwEl.style.color = 'var(--accent)';
+                        } else {
+                            ufwEl.textContent = 'UNAVAILABLE - bans fall back to RCON ban-ip. Add the sudoers entry (README step 6a) and they will be promoted automatically.';
+                            ufwEl.style.color = 'var(--red)';
+                        }
+                    }
                     var body = document.getElementById('bansBody');
                     body.innerHTML = '';
                     if (!arr.length) {
