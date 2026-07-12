@@ -25,7 +25,7 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 
 **Plugin management** on `/plugins`
 
-- Live grid of installed plugins with version, file, size, status badge
+- Live grid of installed plugins with version, file, size, status badge. Plugin list is parsed from the Paper startup line in docker logs, with automatic fallbacks to RCON `plugins` and to scanning `plugins/*.jar` when the log has been rotated or the container recreated
 - Search by name, sort (name/size/status), filter (all / no URL / has URL / JAR missing)
 - Per-plugin update via saved URL — downloads to staging, SHA-256 compares, **discards if identical** (no unnecessary restart)
 - Update All — sequential per-plugin downloads with individual toasts and final summary
@@ -39,7 +39,8 @@ Tested on a Paper 1.21.4 server with GeyserMC for Bedrock cross-play, hosting ~1
 - Status banner colored by age (ok / `>30h` warn / `>48h` bad / no backups)
 - Full archive table with size, **delta vs previous backup**, creation date, age
 - **Backup now** button — pauses world saving (`save-off` + `save-all flush`), tars the world dirs in a background thread with live progress, then `save-on`
-- **Delete** button per archive (filename validated, confined to the backup dir)
+- **Restore** button per archive — stops the server (`docker compose stop`), saves the current world as `world-pre-restore-<ts>.tar.gz`, replaces the world with the chosen archive, starts the server again. Failed extraction rolls back automatically from the safety archive. Requires typing `RESTORE` to confirm
+- **Delete** button per archive (filename validated, confined to the backup dir; refused while a job runs)
 
 **Bans** on `/bans`
 
@@ -277,6 +278,7 @@ All endpoints require HTTP Basic Auth. `POST` endpoints additionally require a C
 | POST | `/api/plugins/update` | `file`, `url` (downloads, SHA-256 dedupes) |
 | POST | `/api/plugins/update-all` | Iterates all saved URLs |
 | POST | `/api/backups/create` | Start a backup job (background thread) |
+| POST | `/api/backups/restore` | `filename` — stop server, safety-archive current world, extract, start |
 | POST | `/api/backups/delete` | `filename` (must match `world-*.tar.gz`) |
 | POST | `/api/bans/add` | `ip`, optional `reason` |
 | POST | `/api/bans/remove` | `ip` (unban via the original method) |

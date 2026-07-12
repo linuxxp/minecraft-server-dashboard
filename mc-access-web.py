@@ -3,8 +3,21 @@
 Minecraft Access Log Web Viewer
 Runs on port 8090.
 
-Version: 2.1.0
+Version: 2.2.0
 Changelog:
+  v2.2.0 (2026-07-12)
+    - Backup restore: per-archive Restore button on /backups. Flow (background
+      thread, live status): stop the server via docker compose -> archive the
+      current world to world-pre-restore-<ts>.tar.gz -> remove world dirs ->
+      extract the chosen archive -> start the server. If extraction fails the
+      world is rolled back from the safety archive. Requires typing RESTORE
+      to confirm. Delete is refused while a backup/restore job runs.
+    - FIX: /plugins sometimes showed no plugins. The list was parsed only from
+      the "Bukkit plugins (N):" startup line in docker logs, which disappears
+      when the container is recreated or the log is rotated/truncated. Now
+      falls back to RCON `plugins` output, then to scanning plugins/*.jar
+      filenames, and finally to the last successfully parsed list kept in
+      memory - the page can no longer come up empty while the server runs.
   v2.1.0 (2026-07-11)
     - Backups: "Backup now" button on /backups (save-off -> save-all flush ->
       tar -> save-on, runs in a background thread with live status) and a
@@ -262,6 +275,7 @@ import glob
 import time
 import hmac
 import secrets
+import shutil
 import logging
 import functools
 import subprocess
@@ -347,7 +361,8 @@ ONBOARDING_FILE = "/home/pi/mc-onboarding-state.json"
 BACKUP_DIR = "/opt/minecraft/backups"
 WORLD_DIR = "/opt/minecraft/data"
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
+COMPOSE_FILE = "/opt/minecraft/docker-compose.yml"
 ONBOARDING_DEFAULT_MINUTES = 5
 ONBOARDING_MAX_MINUTES = 30
 
@@ -1404,7 +1419,7 @@ def api_whitelist_onboard_cancel():
 @requires_csrf
 def api_restart():
     try:
-        subprocess.Popen(['docker', 'compose', '-f', '/opt/minecraft/docker-compose.yml', 'restart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(['docker', 'compose', '-f', COMPOSE_FILE, 'restart'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cache_invalidate()
         log.info("server restart triggered")
         return _respond('Server restarting...', toast='warning')
@@ -2216,40 +2231,103 @@ def _match_score(plugin_name, jar_filename):
         return 50
     return 0
 
-def get_plugins_list():
+def _parse_plugin_items(text):
+    """Parse a comma-separated plugin list: 'Name (ver), Name2 (ver)' or bare
+    'Name, Name2' (RCON `plugins` output has no versions on some builds)."""
     plugins = []
+    seen = set()
+    after = re.sub(r'^-\s*', '', text.strip())
+    for item in re.split(r',\s*', after):
+        item = item.strip().lstrip('-').strip()
+        if not item:
+            continue
+        m = re.match(r'([A-Za-z][A-Za-z0-9_-]+(?:[- ][A-Za-z0-9_]+)*)\s*\((.+)\)\s*$', item)
+        if m:
+            name, version = m.group(1).strip(), m.group(2).strip()
+        else:
+            m = re.match(r'^\*?([A-Za-z][A-Za-z0-9_ -]{0,60})$', item)
+            if not m:
+                continue
+            name, version = m.group(1).strip(), '?'
+        if name and name not in seen:
+            seen.add(name)
+            plugins.append({'name': name, 'version': version})
+    return plugins
+
+def _plugins_from_docker_logs():
+    """Primary source: the 'Bukkit plugins (N):' line Paper prints at startup.
+    Richest data (includes versions), but the line disappears when the
+    container is recreated or the docker log is rotated/truncated."""
     try:
-        # Use grep to find the Bukkit plugins line efficiently (logs can be 50000+ lines)
-        result = subprocess.run('docker logs minecraft 2>&1 | grep -A 2 "Bukkit plugins"', shell=True, capture_output=True, text=True, timeout=15)
+        # grep keeps this cheap on 50000+ line logs
+        result = subprocess.run('docker logs minecraft 2>&1 | grep -A 2 "Bukkit plugins"',
+                                shell=True, capture_output=True, text=True, timeout=15)
         text = strip_ansi(result.stdout)
         lines = text.split('\n')
         found_idx = -1
         for i, line in enumerate(lines):
             if 'Bukkit plugins' in line:
                 found_idx = i
-        if found_idx >= 0:
-            plugin_text = lines[found_idx]
-            for j in range(found_idx + 1, min(found_idx + 5, len(lines))):
-                stripped = lines[j].strip()
-                if stripped.startswith('-') or (stripped and not stripped.startswith('[')):
-                    plugin_text += ' ' + stripped
-                else:
-                    break
-            match = re.search(r'Bukkit plugins\s*\(\d+\):\s*(.*)', plugin_text, re.DOTALL)
-            if match:
-                after = re.sub(r'^-\s*', '', match.group(1).strip())
-                seen = set()
-                for item in re.split(r',\s*', after):
-                    item = item.strip()
-                    m = re.match(r'([A-Za-z][A-Za-z0-9_-]+(?:[- ][A-Za-z0-9_]+)*)\s*\((.+)\)', item)
-                    if m:
-                        name = m.group(1).strip()
-                        version = m.group(2).strip()
-                        if name not in seen:
-                            seen.add(name)
-                            plugins.append({'name': name, 'version': version})
+        if found_idx < 0:
+            return []
+        plugin_text = lines[found_idx]
+        for j in range(found_idx + 1, min(found_idx + 5, len(lines))):
+            stripped = lines[j].strip()
+            if stripped.startswith('-') or (stripped and not stripped.startswith('[')):
+                plugin_text += ' ' + stripped
+            else:
+                break
+        match = re.search(r'Bukkit plugins\s*\(\d+\):\s*(.*)', plugin_text, re.DOTALL)
+        if match:
+            return _parse_plugin_items(match.group(1))
     except Exception:
-        log.exception("plugin list parse failed")
+        log.exception("plugin list parse from docker logs failed")
+    return []
+
+def _plugins_from_rcon():
+    """Fallback: ask the live server via RCON `plugins`. Always available while
+    the server runs; some builds omit versions (shown as '?')."""
+    out = rcon_cached('plugins', ttl_seconds=60)
+    if not out or out.startswith('Error'):
+        return []
+    text = out.replace('\n', ' ')
+    m = re.search(r'[Pp]lugins\s*(?:\(\d+\))?\s*:\s*(.*)$', text, re.DOTALL)
+    if not m:
+        return []
+    return _parse_plugin_items(m.group(1))
+
+def _plugins_from_jar_files():
+    """Last resort: derive plugin names from plugins/*.jar filenames."""
+    plugins = []
+    seen = set()
+    plugins_dir = os.path.join(WORLD_DIR, 'plugins')
+    try:
+        for fn in sorted(os.listdir(plugins_dir)):
+            if not fn.endswith('.jar'):
+                continue
+            base = fn[:-4]
+            # Strip a trailing version-ish suffix: Name-1.2.3 / Name_v5 -> Name
+            name = re.sub(r'[-_]v?\d[\w.+-]*$', '', base) or base
+            if name not in seen:
+                seen.add(name)
+                plugins.append({'name': name, 'version': '?'})
+    except Exception:
+        log.exception("plugins dir scan failed")
+    return plugins
+
+_last_good_plugins = []
+
+def get_plugins_list():
+    global _last_good_plugins
+    plugins = _plugins_from_docker_logs()
+    if not plugins:
+        plugins = _plugins_from_rcon()
+        if plugins:
+            log.info("plugin list source: rcon `plugins` (startup line missing from docker logs)")
+    if not plugins:
+        plugins = _plugins_from_jar_files()
+        if plugins:
+            log.info("plugin list source: plugins/*.jar filenames (docker logs and RCON unavailable)")
 
     plugins_dir = os.path.join(WORLD_DIR, 'plugins')
     urls = load_plugin_urls()
@@ -2304,6 +2382,15 @@ def get_plugins_list():
             p['file'] = '?'
             p['size'] = '?'
         p['url'] = urls.get(p.get('file', ''), '')
+
+    # Safety net: remember the last non-empty result and serve it when every
+    # source transiently fails (e.g. server restarting mid-request).
+    if plugins:
+        _last_good_plugins = [dict(p) for p in plugins]
+    elif _last_good_plugins:
+        log.warning("all plugin sources came up empty - serving last known list (%d plugins)",
+                    len(_last_good_plugins))
+        return [dict(p) for p in _last_good_plugins]
 
     return plugins
 
@@ -3990,8 +4077,20 @@ def get_backups_list():
 # ----------------------------------------------------------------------------
 BACKUP_NAME_RE = re.compile(r'^world-[A-Za-z0-9._-]{1,80}\.tar\.gz$')
 
-_backup_state = {'running': False, 'started_at': '', 'finished_at': '', 'ok': None, 'message': ''}
+_backup_state = {'kind': '', 'running': False, 'started_at': '', 'finished_at': '', 'ok': None, 'message': ''}
 _backup_lock = threading.Lock()
+
+def _job_set_message(message):
+    with _backup_lock:
+        _backup_state['message'] = message
+
+def _job_finish(ok, message):
+    with _backup_lock:
+        _backup_state.update({
+            'running': False,
+            'finished_at': datetime.now().replace(microsecond=0).isoformat(),
+            'ok': ok, 'message': message,
+        })
 
 def _run_backup_job(filename):
     global _backup_state
@@ -4033,13 +4132,73 @@ def _run_backup_job(filename):
                 pass
     finally:
         rcon('save-on')
-    with _backup_lock:
-        _backup_state.update({
-            'running': False,
-            'finished_at': datetime.now().replace(microsecond=0).isoformat(),
-            'ok': ok, 'message': message,
-        })
+    _job_finish(ok, message)
     log.info("backup job done: ok=%s message=%r", ok, message)
+
+def _run_restore_job(filename):
+    """Restore a world archive. Steps (each reflected in the live status):
+      1. docker compose stop          — abort if it fails, world untouched
+      2. tar current world dirs to world-pre-restore-<ts>.tar.gz (safety net)
+      3. remove world/world_nether/world_the_end
+      4. tar -xzf the chosen archive  — on failure, roll back from step 2
+      5. docker compose start (always, in finally)
+    """
+    src = os.path.join(BACKUP_DIR, filename)
+    ok = False
+    message = ''
+    safety = None
+    try:
+        _job_set_message('Stopping the server...')
+        r = subprocess.run(['docker', 'compose', '-f', COMPOSE_FILE, 'stop'],
+                           capture_output=True, text=True, timeout=240)
+        if r.returncode != 0:
+            message = f'Could not stop the server (rc={r.returncode}): {(r.stderr or "")[:150]}. World untouched.'
+            return
+
+        dirs = [w for w in ('world', 'world_nether', 'world_the_end')
+                if os.path.isdir(os.path.join(WORLD_DIR, w))]
+        if dirs:
+            safety = f"world-pre-restore-{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.tar.gz"
+            _job_set_message(f'Archiving current world to {safety}...')
+            r = subprocess.run(['tar', '-czf', os.path.join(BACKUP_DIR, safety), '-C', WORLD_DIR] + dirs,
+                               capture_output=True, text=True, timeout=3600)
+            if r.returncode not in (0, 1):
+                message = f'Safety archive failed (rc={r.returncode}) - aborting, world untouched.'
+                return
+
+            _job_set_message('Removing current world...')
+            for w in dirs:
+                shutil.rmtree(os.path.join(WORLD_DIR, w), ignore_errors=True)
+
+        _job_set_message(f'Extracting {filename}...')
+        r = subprocess.run(['tar', '-xzf', src, '-C', WORLD_DIR],
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode != 0:
+            if safety:
+                _job_set_message('Extract FAILED - rolling back from the safety archive...')
+                rb = subprocess.run(['tar', '-xzf', os.path.join(BACKUP_DIR, safety), '-C', WORLD_DIR],
+                                    capture_output=True, text=True, timeout=3600)
+                rolled = 'world rolled back from' if rb.returncode == 0 else 'ROLLBACK ALSO FAILED - check'
+                message = f'Extract of {filename} failed (rc={r.returncode}); {rolled} {safety}.'
+            else:
+                message = f'Extract of {filename} failed (rc={r.returncode}).'
+            return
+
+        ok = True
+        message = f'Restored {filename}.' + (f' Previous world saved as {safety}.' if safety else '')
+    except Exception as e:
+        log.exception("restore job failed")
+        message = f'Restore failed: {e}'
+    finally:
+        _job_set_message((message + ' ' if message else '') + 'Starting the server...')
+        try:
+            subprocess.run(['docker', 'compose', '-f', COMPOSE_FILE, 'start'],
+                           capture_output=True, text=True, timeout=240)
+        except Exception:
+            log.exception("server start after restore failed")
+        cache_invalidate()
+        _job_finish(ok, message)
+        log.info("restore job done: ok=%s message=%r", ok, message)
 
 @app.route('/api/backups/create', methods=['POST'])
 @requires_auth
@@ -4048,10 +4207,11 @@ def api_backups_create():
     global _backup_state
     with _backup_lock:
         if _backup_state['running']:
-            return _respond('A backup is already running', redirect_to='/backups', toast='warning')
+            return _respond(f'A {_backup_state.get("kind") or "backup"} job is already running',
+                            redirect_to='/backups', toast='warning')
         filename = f"world-{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.tar.gz"
         _backup_state = {
-            'running': True,
+            'kind': 'backup', 'running': True,
             'started_at': datetime.now().replace(microsecond=0).isoformat(),
             'finished_at': '', 'ok': None, 'message': f'Backing up to {filename}...',
         }
@@ -4059,6 +4219,33 @@ def api_backups_create():
     log.info("backup job started: %s", filename)
     return _respond(f'Backup started ({filename}). This can take a few minutes.',
                     redirect_to='/backups', toast='info')
+
+@app.route('/api/backups/restore', methods=['POST'])
+@requires_auth
+@requires_csrf
+def api_backups_restore():
+    global _backup_state
+    filename = request.form.get('filename', '').strip()
+    if not filename or not BACKUP_NAME_RE.match(filename):
+        return _respond('Bad backup filename', redirect_to='/backups', toast='error')
+    path = os.path.realpath(os.path.join(BACKUP_DIR, filename))
+    if not path.startswith(os.path.realpath(BACKUP_DIR) + os.sep):
+        return _respond('Bad backup path', redirect_to='/backups', toast='error')
+    if not os.path.exists(path):
+        return _respond(f'{filename} not found', redirect_to='/backups', toast='error')
+    with _backup_lock:
+        if _backup_state['running']:
+            return _respond(f'A {_backup_state.get("kind") or "backup"} job is already running',
+                            redirect_to='/backups', toast='warning')
+        _backup_state = {
+            'kind': 'restore', 'running': True,
+            'started_at': datetime.now().replace(microsecond=0).isoformat(),
+            'finished_at': '', 'ok': None, 'message': f'Preparing to restore {filename}...',
+        }
+    threading.Thread(target=_run_restore_job, args=(filename,), daemon=True, name='restore-job').start()
+    log.info("restore job started: %s", filename)
+    return _respond(f'Restore of {filename} started - the server is going down for it.',
+                    redirect_to='/backups', toast='warning')
 
 @app.route('/api/backups/status')
 @requires_auth
@@ -4071,6 +4258,10 @@ def api_backups_status():
 @requires_auth
 @requires_csrf
 def api_backups_delete():
+    with _backup_lock:
+        if _backup_state['running']:
+            return _respond('A backup/restore job is running - try again when it finishes',
+                            redirect_to='/backups', toast='warning')
     filename = request.form.get('filename', '').strip()
     if not filename or not BACKUP_NAME_RE.match(filename):
         return _respond('Bad backup filename', redirect_to='/backups', toast='error')
@@ -4157,7 +4348,10 @@ def backups_page():
             <td>{delta_html}</td>
             <td>{esc(b['mtime'])}</td>
             <td>{esc(b['age_human'])} ago</td>
-            <td><button class="bk-delete" data-filename="{esc(b['filename'])}" title="Delete this backup">&#x1F5D1;</button></td>
+            <td style="white-space:nowrap;">
+                <button class="bk-restore" data-filename="{esc(b['filename'])}" title="Restore this backup (stops the server!)">&#x27F2; Restore</button>
+                <button class="bk-delete" data-filename="{esc(b['filename'])}" title="Delete this backup">&#x1F5D1;</button>
+            </td>
         </tr>"""
     if not cards:
         cards = '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:30px;">No backup files found in ' + esc(BACKUP_DIR) + '</td></tr>'
@@ -4235,6 +4429,8 @@ BACKUPS_TEMPLATE = """
         .btn-backup-now:disabled { opacity: 0.5; cursor: wait; }
         .bk-delete { background: none; border: 1px solid var(--red); color: var(--red); cursor: pointer; font-size: 0.9em; padding: 3px 9px; border-radius: 4px; }
         .bk-delete:hover { background: var(--red); color: #fff; }
+        .bk-restore { background: none; border: 1px solid var(--yellow); color: var(--yellow); cursor: pointer; font-size: 0.82em; padding: 3px 9px; border-radius: 4px; }
+        .bk-restore:hover { background: var(--yellow); color: #000; }
         .backup-progress { display: none; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 0.95em; background: var(--msg-bg); color: var(--blue); border: 1px solid var(--blue); }
         .backup-progress .spin { display: inline-block; animation: bkspin 1.2s linear infinite; }
         @keyframes bkspin { to { transform: rotate(360deg); } }
@@ -4282,8 +4478,9 @@ BACKUPS_TEMPLATE = """
     </table>
     <div class="backup-dir-info">
         Backups can be created by the host's backup cron job or with the <strong>Backup now</strong> button
-        (world saving is paused during the archive). To restore a backup:
-        stop the server (<code>docker compose down</code>), extract the chosen tarball into the world directory, then start again.
+        (world saving is paused during the archive). <strong>Restore</strong> stops the server, saves the current
+        world as <code>world-pre-restore-*.tar.gz</code> (your undo button), swaps in the chosen archive and starts
+        the server again &mdash; so a bad restore is always recoverable by restoring the pre-restore archive.
         <br>v__VERSION__
     </div>
 
@@ -4311,13 +4508,17 @@ BACKUPS_TEMPLATE = """
                 .then(function(s) {
                     var box = document.getElementById('backupProgress');
                     var btn = document.getElementById('backupNowBtn');
+                    var rowBtns = document.querySelectorAll('.bk-restore, .bk-delete');
                     if (s.running) {
                         box.style.display = 'block';
-                        document.getElementById('backupProgressText').textContent = s.message || 'Backup running...';
+                        document.getElementById('backupProgressText').textContent =
+                            (s.kind === 'restore' ? '[RESTORE] ' : '') + (s.message || 'Job running...');
                         btn.disabled = true;
+                        rowBtns.forEach(function(b){ b.disabled = true; b.style.opacity = 0.4; });
                         if (!pollTimer) pollTimer = setInterval(pollBackupStatus, 3000);
                     } else {
                         btn.disabled = false;
+                        rowBtns.forEach(function(b){ b.disabled = false; b.style.opacity = 1; });
                         if (pollTimer) {
                             // A poll cycle was active -> a backup just finished
                             clearInterval(pollTimer); pollTimer = null;
@@ -4345,6 +4546,34 @@ BACKUPS_TEMPLATE = """
                   if (!pollTimer) pollTimer = setInterval(pollBackupStatus, 3000);
                   pollBackupStatus();
               }).catch(function(err){ showToast('Network: ' + err, 'error'); });
+        });
+
+        document.querySelectorAll('.bk-restore').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var fn = btn.dataset.filename;
+                var typed = prompt(
+                    'RESTORE "' + fn + '"?\\n\\n' +
+                    'This will:\\n' +
+                    '  1) STOP the Minecraft server (players get disconnected)\\n' +
+                    '  2) archive the current world as world-pre-restore-*.tar.gz\\n' +
+                    '  3) REPLACE the world with this backup\\n' +
+                    '  4) start the server again\\n\\n' +
+                    'Type RESTORE (in capitals) to confirm:');
+                if (typed === null) return;
+                if (typed !== 'RESTORE') { showToast('Restore cancelled - you must type RESTORE', 'warning'); return; }
+                var fd = new FormData();
+                fd.append('csrf_token', CSRF_TOKEN);
+                fd.append('filename', fn);
+                fetch('/api/backups/restore', {
+                    method: 'POST', body: fd,
+                    headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+                }).then(function(r){ return r.json(); })
+                  .then(function(d) {
+                      showToast(d.message || 'Restore started', d.toast || 'info');
+                      if (!pollTimer) pollTimer = setInterval(pollBackupStatus, 3000);
+                      pollBackupStatus();
+                  }).catch(function(err){ showToast('Network: ' + err, 'error'); });
+            });
         });
 
         document.querySelectorAll('.bk-delete').forEach(function(btn) {
